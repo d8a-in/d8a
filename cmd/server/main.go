@@ -7,16 +7,21 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"d8a.in/d8a/internal/core"
+	"d8a.in/d8a/internal/server"
 )
 
 func main() {
 	showVersion := flag.Bool("version", false, "print version and exit")
+	listen := flag.String("listen", server.DefaultListenAddr, "HTTP listen address")
 	flag.Parse()
 
 	if *showVersion {
@@ -24,8 +29,18 @@ func main() {
 		return
 	}
 
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
-	logger.Info("d8a-server starting", "version", core.Version)
+	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	log.Info("d8a-server starting", "version", core.Version)
 
-	// TODO: load config, start HTTP server, load MCP runners.
+	// Catch SIGINT (Ctrl-C) and SIGTERM (systemd/`kill`) so the
+	// server can drain in-flight requests on shutdown.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	srv := server.New(server.Config{ListenAddr: *listen}, log)
+	if err := srv.Run(ctx); err != nil {
+		log.Error("server error", "err", err)
+		os.Exit(1)
+	}
+	log.Info("d8a-server stopped cleanly")
 }
