@@ -27,6 +27,16 @@ go run ./cmd/server --version
 go run ./cmd/client --version
 ```
 
-## License
+## License & Model
 
-[Apache-2.0](LICENSE).
+d8a is intentionally **permissive open source** ([Apache-2.0](LICENSE)). We chose permissive licensing over source-available alternatives (BSL, Elastic License, SSPL, AGPL) for three reasons:
+
+- **The moat lives in the architecture, not the license.** Paid d8a.in features — secure tunnel, control plane, signed policy distribution, multi-connector fleets, threat-rule intelligence — are closed source and live in a separate repository. The open-source server and client deliver a complete, useful, self-hostable product on a trusted network *on their own*; the paid layer adds secure-remote access, scale, and central governance.
+- **Trust is a feature.** For a security product, "you can read every line of code that touches your data" is a stronger guarantee than any vendor promise. Permissive licensing preserves that without legal asterisks.
+- **Adoption matters more than defending against forks.** Our wedge user is a developer self-hosting on a trusted network; we want as few barriers as possible.
+
+Want the paid features? See [d8a.in](https://d8a.in).
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). All commits must be DCO-signed (`git commit -s`).
