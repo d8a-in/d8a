@@ -11,6 +11,14 @@ import (
 	"time"
 )
 
+// testServerOpts customizes the test-server harness without making the
+// production Config type depend on test concerns.
+type testServerOpts struct {
+	validator      Validator
+	audience       string
+	allowedOrigins []string
+}
+
 // pickAddr returns a free loopback address. There is a small race
 // window between releasing the listener and the server claiming the
 // address, but it's acceptable for tests and avoids hard-coding ports.
@@ -27,14 +35,19 @@ func pickAddr(t *testing.T) string {
 	return addr
 }
 
-// startTestServer launches the server in the background and returns its
-// base URL and a teardown function that triggers graceful shutdown and
-// waits for it to complete.
-func startTestServer(t *testing.T) (baseURL string, teardown func()) {
+// startTestServer launches the server in the background and returns
+// its base URL and a teardown function that triggers graceful
+// shutdown and waits for it to complete.
+func startTestServer(t *testing.T, opts testServerOpts) (baseURL string, teardown func()) {
 	t.Helper()
 	addr := pickAddr(t)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := New(Config{ListenAddr: addr}, log)
+	srv := New(Config{
+		ListenAddr:     addr,
+		Audience:       opts.audience,
+		AllowedOrigins: opts.allowedOrigins,
+		Validator:      opts.validator,
+	}, log)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -62,8 +75,10 @@ func startTestServer(t *testing.T) (baseURL string, teardown func()) {
 	return "", func() {}
 }
 
+// ----- /healthz (unauthenticated) -----
+
 func TestHealthzReturnsOK(t *testing.T) {
-	base, teardown := startTestServer(t)
+	base, teardown := startTestServer(t, testServerOpts{})
 	defer teardown()
 
 	resp, err := http.Get(base + "/healthz")
@@ -85,10 +100,7 @@ func TestHealthzReturnsOK(t *testing.T) {
 }
 
 func TestHealthzRejectsWrongMethod(t *testing.T) {
-	// The route was registered with the Go 1.22+ method pattern
-	// "GET /healthz", so anything else should fall through to the
-	// default 405 handler.
-	base, teardown := startTestServer(t)
+	base, teardown := startTestServer(t, testServerOpts{})
 	defer teardown()
 
 	req, err := http.NewRequest(http.MethodPost, base+"/healthz", nil)
@@ -103,5 +115,92 @@ func TestHealthzRejectsWrongMethod(t *testing.T) {
 
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusMethodNotAllowed)
+	}
+}
+
+// ----- /mcp (gated by the middleware stack) -----
+
+func mcpTestOpts(t *testing.T) testServerOpts {
+	t.Helper()
+	return testServerOpts{
+		validator:      newValidatorWithKey(t, "secret", "http://aud.example/mcp", "alice", []string{"postgres:read"}),
+		audience:       "http://aud.example/mcp",
+		allowedOrigins: []string{"http://allowed.example"},
+	}
+}
+
+func TestMCP_RequiresAuth(t *testing.T) {
+	base, teardown := startTestServer(t, mcpTestOpts(t))
+	defer teardown()
+
+	resp, err := http.Get(base + "/mcp")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+	if got := resp.Header.Get("WWW-Authenticate"); got != `Bearer realm="d8a"` {
+		t.Fatalf("WWW-Authenticate = %q, want bearer challenge", got)
+	}
+}
+
+func TestMCP_RejectsDisallowedOrigin(t *testing.T) {
+	base, teardown := startTestServer(t, mcpTestOpts(t))
+	defer teardown()
+
+	req, _ := http.NewRequest(http.MethodGet, base+"/mcp", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Origin", "http://evil.example")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", resp.StatusCode)
+	}
+}
+
+func TestMCP_RejectsBadProtocolVersion(t *testing.T) {
+	base, teardown := startTestServer(t, mcpTestOpts(t))
+	defer teardown()
+
+	req, _ := http.NewRequest(http.MethodGet, base+"/mcp", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("MCP-Protocol-Version", "9999-99-99")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestMCP_AuthorizedReaches501Placeholder(t *testing.T) {
+	base, teardown := startTestServer(t, mcpTestOpts(t))
+	defer teardown()
+
+	req, _ := http.NewRequest(http.MethodGet, base+"/mcp", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("MCP-Protocol-Version", "2025-11-25")
+	req.Header.Set("Origin", "http://allowed.example")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want 501 (placeholder)", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("Content-Type = %q, want application/json...", ct)
 	}
 }

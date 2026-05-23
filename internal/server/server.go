@@ -7,6 +7,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -22,11 +23,26 @@ import (
 const DefaultListenAddr = "127.0.0.1:8443"
 
 // Config holds the user-facing server configuration. New fields here
-// should also be reachable via flags/env in cmd/server.
+// should also be reachable via the FileConfig + flags in cmd/server.
 type Config struct {
 	// ListenAddr is the address the HTTP server binds to.
 	// Empty string falls back to DefaultListenAddr.
 	ListenAddr string
+
+	// Audience is the canonical URL of this d8a-server instance.
+	// Bearer tokens presented by clients must be bound to this
+	// audience (RFC 8707) to be accepted.
+	Audience string
+
+	// AllowedOrigins is the allow-list for the HTTP `Origin` header
+	// (DNS-rebinding defense). Empty allow-list with a request that
+	// carries any non-empty Origin is denied with 403.
+	AllowedOrigins []string
+
+	// Validator authenticates Bearer tokens presented at /mcp.
+	// Required when the /mcp endpoint is exposed; if nil, /mcp will
+	// uniformly return 401 (the safe failure mode).
+	Validator Validator
 }
 
 // Server is the d8a-server runtime. Construct with New, then call Run.
@@ -55,10 +71,24 @@ func New(cfg Config, log *slog.Logger) *Server {
 	return s
 }
 
-// routes registers HTTP routes on mux. Kept separate so tests (and future
-// reuse) can register the same routes on a different mux.
+// routes registers HTTP routes on mux.
+//
+// /healthz is a public liveness probe — no auth, no middleware. /mcp
+// is the placeholder for the MCP Streamable HTTP endpoint, guarded by
+// the full middleware stack so M2's behavior can be exercised before
+// any MCP logic exists. Middleware order is intentional: cheapest
+// rejections first.
 func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
+
+	mcp := Chain(
+		http.HandlerFunc(s.handleMCPPlaceholder),
+		RequireOrigin(s.cfg.AllowedOrigins, s.log),
+		ParseProtocolVersion(),
+		RequireAuth(s.cfg.Validator, s.cfg.Audience, s.log),
+	)
+	mux.Handle("POST /mcp", mcp)
+	mux.Handle("GET /mcp", mcp)
 }
 
 // handleHealthz is a basic liveness probe — proves the process is up
@@ -68,6 +98,24 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok\n"))
+}
+
+// handleMCPPlaceholder runs after the middleware stack has accepted a
+// request. M3 will replace it with the real initialize handshake.
+// For now it returns 501 with a small JSON body that echoes the
+// resolved identity and protocol version, so a hands-on smoke test
+// can verify each middleware did its job.
+func (s *Server) handleMCPPlaceholder(w http.ResponseWriter, r *http.Request) {
+	id, _ := IdentityFromContext(r.Context())
+	v, _ := ProtocolVersionFromContext(r.Context())
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotImplemented)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error":           "mcp endpoint not yet implemented",
+		"note":            "initialize handshake lands in milestone 3",
+		"subject":         id.Subject,
+		"protocolVersion": v,
+	})
 }
 
 // shutdownTimeout caps how long graceful shutdown is allowed to wait
