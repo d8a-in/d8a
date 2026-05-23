@@ -25,9 +25,14 @@ type ClientCapabilities map[string]json.RawMessage
 type ServerCapabilities map[string]json.RawMessage
 
 // InitializeParams is the params block of an `initialize` request.
+//
+// `capabilities` is REQUIRED by the MCP spec even when empty — strict
+// backing MCPs (e.g. ones using Zod / pydantic) reject the handshake
+// otherwise — so we deliberately omit `,omitempty` so an empty map
+// serializes as `{}` rather than being dropped.
 type InitializeParams struct {
 	ProtocolVersion string             `json:"protocolVersion"`
-	Capabilities    ClientCapabilities `json:"capabilities,omitempty"`
+	Capabilities    ClientCapabilities `json:"capabilities"`
 	ClientInfo      Implementation     `json:"clientInfo"`
 }
 
