@@ -342,3 +342,130 @@ func TestDeleteMCP_RequiresSessionHeader(t *testing.T) {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
 	}
 }
+
+// ----- backend forwarding (M4) -----
+
+// mcpTestOptsWithBackend returns test options including a real
+// StdioRunner backed by the test-helper fake MCP. The harness's
+// teardown will Stop the runner via Server.Run's deferred cleanup.
+func mcpTestOptsWithBackend(t *testing.T) testServerOpts {
+	t.Helper()
+	opts := mcpTestOpts(t)
+	opts.runner = NewStdioRunner(fakeMCPCmd(t),
+		Implementation{Name: "d8a-server-test", Version: "0"},
+		newRunnerLogger())
+	return opts
+}
+
+func TestInitialize_AdvertisesBackendCapabilities(t *testing.T) {
+	base, teardown := startTestServer(t, mcpTestOptsWithBackend(t))
+	defer teardown()
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}`
+	resp := mcpPost(t, base, "secret", "", body)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	msg := decodeRPC(t, resp.Body)
+	var result InitializeResult
+	if err := json.Unmarshal(msg.Result, &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	// The fake MCP advertises {"tools":{}}; we should pass that
+	// through into our own initialize response.
+	if _, ok := result.Capabilities["tools"]; !ok {
+		t.Fatalf("Capabilities = %v, want tools key (forwarded from backend)", result.Capabilities)
+	}
+}
+
+func TestToolsList_ForwardedToBackend(t *testing.T) {
+	base, teardown := startTestServer(t, mcpTestOptsWithBackend(t))
+	defer teardown()
+
+	sid := initializeSession(t, base, "secret")
+
+	resp := mcpPost(t, base, "secret", sid, `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	msg := decodeRPC(t, resp.Body)
+	if msg.Error != nil {
+		t.Fatalf("Error = %+v", msg.Error)
+	}
+	var result struct {
+		Tools []struct {
+			Name string `json:"name"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(msg.Result, &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(result.Tools) != 1 || result.Tools[0].Name != "echo" {
+		t.Fatalf("tools/list = %+v, want [echo]", result.Tools)
+	}
+}
+
+func TestToolsCall_ForwardedAndPreservesResult(t *testing.T) {
+	base, teardown := startTestServer(t, mcpTestOptsWithBackend(t))
+	defer teardown()
+
+	sid := initializeSession(t, base, "secret")
+
+	// The fake echoes params back as "content". Send a distinctive
+	// payload and confirm we receive it verbatim.
+	body := `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo","arguments":{"x":42}}}`
+	resp := mcpPost(t, base, "secret", sid, body)
+	defer resp.Body.Close()
+
+	msg := decodeRPC(t, resp.Body)
+	if msg.Error != nil {
+		t.Fatalf("Error = %+v", msg.Error)
+	}
+	var result struct {
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(msg.Result, &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if string(result.Content) != `{"name":"echo","arguments":{"x":42}}` {
+		t.Fatalf("content = %s, want params echoed back verbatim", result.Content)
+	}
+}
+
+func TestBackendError_ForwardedAsJSONRPCError(t *testing.T) {
+	base, teardown := startTestServer(t, mcpTestOptsWithBackend(t))
+	defer teardown()
+
+	sid := initializeSession(t, base, "secret")
+
+	resp := mcpPost(t, base, "secret", sid, `{"jsonrpc":"2.0","id":4,"method":"boom"}`)
+	defer resp.Body.Close()
+
+	msg := decodeRPC(t, resp.Body)
+	if msg.Error == nil {
+		t.Fatal("expected error from backing boom method")
+	}
+	if msg.Error.Code != -32000 {
+		t.Errorf("Code = %d, want -32000 (backend's error code preserved)", msg.Error.Code)
+	}
+}
+
+func TestMethodNotFound_WithoutBackend(t *testing.T) {
+	// No backend → unknown methods return our own method-not-found,
+	// not a forwarded error.
+	base, teardown := startTestServer(t, mcpTestOpts(t))
+	defer teardown()
+
+	sid := initializeSession(t, base, "secret")
+	resp := mcpPost(t, base, "secret", sid, `{"jsonrpc":"2.0","id":5,"method":"tools/list"}`)
+	defer resp.Body.Close()
+
+	msg := decodeRPC(t, resp.Body)
+	if msg.Error == nil || msg.Error.Code != ErrCodeMethodNotFound {
+		t.Fatalf("Error = %+v, want code %d", msg.Error, ErrCodeMethodNotFound)
+	}
+}

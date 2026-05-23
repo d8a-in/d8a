@@ -8,6 +8,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
@@ -52,6 +53,14 @@ type Config struct {
 	// Sessions is the SessionStore implementation. If nil, an
 	// InMemorySessionStore is constructed in New.
 	Sessions SessionStore
+
+	// Runner is an optional backing MCP. When set, Run starts it
+	// before accepting HTTP traffic, caches its advertised
+	// capabilities (so `initialize` responses can announce them),
+	// forwards MCP requests through it, and stops it on shutdown.
+	// When nil, the server only handles ping locally and returns
+	// "method not found" for everything else.
+	Runner Runner
 }
 
 // Server is the d8a-server runtime. Construct with New, then call Run.
@@ -60,6 +69,15 @@ type Server struct {
 	log      *slog.Logger
 	http     *http.Server
 	sessions SessionStore
+
+	// runner is the live backing MCP, populated by Run after a
+	// successful Start. nil when no runner is configured.
+	runner Runner
+
+	// backendCaps is what the backing MCP advertised during its own
+	// initialize. Returned in d8a-server's initialize response so
+	// upstream MCP clients see the underlying capabilities.
+	backendCaps ServerCapabilities
 }
 
 // New constructs a Server. Defaults are applied to cfg before use.
@@ -124,9 +142,28 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 const shutdownTimeout = 10 * time.Second
 
 // Run starts the HTTP server and blocks until either ctx is canceled
-// (triggering a graceful shutdown) or the listener errors. It returns
-// the first error encountered, or nil on a clean shutdown.
+// (triggering a graceful shutdown) or the listener errors.
+//
+// If a Runner is configured, Run starts it *before* listening so we
+// never accept traffic against a backend that's not ready, caches its
+// capabilities, and stops it *after* HTTP has drained so in-flight
+// requests are not abruptly cut off.
 func (s *Server) Run(ctx context.Context) error {
+	if s.cfg.Runner != nil {
+		s.runner = s.cfg.Runner
+		s.log.Info("starting backing MCP")
+		caps, err := s.runner.Start(ctx)
+		if err != nil {
+			return fmt.Errorf("backing mcp start: %w", err)
+		}
+		s.backendCaps = caps
+		defer func() {
+			if err := s.runner.Stop(); err != nil {
+				s.log.Warn("backing mcp stop", "err", err)
+			}
+		}()
+	}
+
 	s.log.Info("listening", "addr", s.cfg.ListenAddr)
 
 	serveErr := make(chan error, 1)

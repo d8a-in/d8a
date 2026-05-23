@@ -36,6 +36,32 @@ type FileConfig struct {
 	// entry stores only the SHA-256 hash of its token, never the
 	// token itself.
 	APIKeys []APIKey `json:"apiKeys,omitempty"`
+
+	// Backend is the optional backing MCP this server proxies for.
+	// When set, d8a-server spawns the configured command, performs
+	// its initialize handshake at startup, and forwards MCP method
+	// calls through it.
+	Backend *BackendConfig `json:"backend,omitempty"`
+}
+
+// BackendConfig describes the subprocess to spawn as the backing MCP.
+//
+// SEP-1024 / brainstorming #121: an operator enabling a backing MCP
+// MUST see the exact command and args they're about to execute. The
+// config file is that consent surface — d8a-server logs the resolved
+// command + args at startup so the operator's commit / review
+// captures what's running on their box.
+type BackendConfig struct {
+	// Command is the executable to run (absolute path or PATH-resolved).
+	Command string `json:"command"`
+
+	// Args are positional arguments to Command.
+	Args []string `json:"args,omitempty"`
+
+	// Env is the environment passed through to the subprocess.
+	// Empty / nil means an empty environment (no PATH, no HOME, etc.) —
+	// the operator must explicitly enumerate what the MCP needs.
+	Env map[string]string `json:"env,omitempty"`
 }
 
 // LoadFileConfig reads a JSON FileConfig from disk.

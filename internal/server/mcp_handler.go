@@ -117,13 +117,19 @@ func (s *Server) handleInitialize(w http.ResponseWriter, r *http.Request, msg JS
 	now := time.Now()
 	s.sessions.Create(sessionID, identity.Subject, negotiated, params.ClientInfo, now)
 
+	// Capability advertisement: if a backing MCP is configured, we
+	// pass through what it advertised at its own initialize time
+	// (cached by Run). M5 will filter this through the catalog and
+	// identity scopes per brainstorming #123; M4 forwards it as-is
+	// since there is at most one backend.
+	caps := s.backendCaps
+	if caps == nil {
+		caps = ServerCapabilities{}
+	}
 	result := InitializeResult{
 		ProtocolVersion: negotiated,
-		// M3 announces an empty capability set — no backing MCPs are
-		// wrapped yet. M4 will populate this from the curated catalog
-		// per brainstorming #123.
-		Capabilities: ServerCapabilities{},
-		ServerInfo:   s.serverImpl(),
+		Capabilities:    caps,
+		ServerInfo:      s.serverImpl(),
 	}
 	resp, err := NewResultResponse(msg.ID, result)
 	if err != nil {
@@ -145,35 +151,58 @@ func (s *Server) handleInitialize(w http.ResponseWriter, r *http.Request, msg JS
 // handleNotification handles a JSON-RPC notification (no id, no
 // response). The MCP spec says notifications receive HTTP 202
 // Accepted with no body.
-func (s *Server) handleNotification(w http.ResponseWriter, _ *http.Request, sess *Session, msg JSONRPCMessage) {
+//
+// notifications/initialized is consumed locally to mark the session
+// ready. Everything else is forwarded to the backing MCP (if any) so
+// it can react to cancellations and any future spec-defined
+// notifications without us having to enumerate them.
+func (s *Server) handleNotification(w http.ResponseWriter, r *http.Request, sess *Session, msg JSONRPCMessage) {
 	now := time.Now()
+	s.sessions.Touch(sess.ID, now)
 	switch msg.Method {
 	case "notifications/initialized":
 		s.sessions.MarkInitialized(sess.ID, now)
-	case "notifications/cancelled":
-		// No queued work yet — but we touch the session and accept.
-		s.sessions.Touch(sess.ID, now)
 	default:
-		// Unknown notifications are accepted silently per JSON-RPC
-		// convention (notifications never elicit error responses).
-		s.sessions.Touch(sess.ID, now)
+		if s.runner != nil {
+			if err := s.runner.Notify(r.Context(), msg.Method, msg.Params); err != nil {
+				s.log.Warn("forward notification failed",
+					"method", msg.Method, "err", err)
+			}
+		}
 	}
 	w.WriteHeader(http.StatusAccepted)
 }
 
 // handleRequest handles a JSON-RPC request (has an id, expects a
 // response).
-func (s *Server) handleRequest(w http.ResponseWriter, _ *http.Request, sess *Session, msg JSONRPCMessage) {
+//
+// ping is handled locally (it's part of the basic protocol, not a
+// backend concern). Everything else is forwarded to the backing MCP
+// if one is configured — that's how tools/list, tools/call,
+// resources/*, prompts/*, completion/*, logging/* reach the backing
+// MCP without d8a-server having to enumerate them.
+func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request, sess *Session, msg JSONRPCMessage) {
 	s.sessions.Touch(sess.ID, time.Now())
-	switch msg.Method {
-	case "ping":
-		// MCP ping: empty result, used as a keep-alive.
+	if msg.Method == "ping" {
 		resp, _ := NewResultResponse(msg.ID, struct{}{})
 		writeJSONRPC(w, http.StatusOK, resp)
-	default:
+		return
+	}
+	if s.runner == nil {
 		writeJSONRPC(w, http.StatusOK, NewErrorResponse(msg.ID, ErrCodeMethodNotFound,
 			"method not implemented: "+msg.Method, nil))
+		return
 	}
+	rawResult, rpcErr := s.runner.Call(r.Context(), msg.Method, msg.Params)
+	if rpcErr != nil {
+		writeJSONRPC(w, http.StatusOK, NewErrorResponse(msg.ID, rpcErr.Code, rpcErr.Message, rpcErr.Data))
+		return
+	}
+	// rawResult is already serialized JSON (json.RawMessage); pass
+	// it through verbatim so the backing MCP's exact response is
+	// returned.
+	resp, _ := NewResultResponse(msg.ID, rawResult)
+	writeJSONRPC(w, http.StatusOK, resp)
 }
 
 // handleMCPGet responds to GET /mcp. The spec lets us open an SSE

@@ -12,7 +12,9 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"os/signal"
+	"sort"
 	"syscall"
 
 	"d8a.in/d8a/internal/core"
@@ -66,6 +68,38 @@ func main() {
 		AllowedOrigins: fc.AllowedOrigins,
 		Validator:      validator,
 		ServerVersion:  core.Version,
+	}
+
+	if fc.Backend != nil {
+		// Log the resolved command + args at startup so the
+		// operator's audit trail records exactly what was spawned.
+		// (SEP-1024 / brainstorming #121: explicit consent surface.)
+		log.Info("backing mcp configured",
+			"command", fc.Backend.Command,
+			"args", fc.Backend.Args)
+
+		cmd := exec.Command(fc.Backend.Command, fc.Backend.Args...)
+		if len(fc.Backend.Env) > 0 {
+			keys := make([]string, 0, len(fc.Backend.Env))
+			for k := range fc.Backend.Env {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			env := make([]string, 0, len(keys))
+			for _, k := range keys {
+				env = append(env, k+"="+fc.Backend.Env[k])
+			}
+			cmd.Env = env
+		} else {
+			// Empty (not nil) so StdioRunner doesn't default to
+			// inheriting our environment.
+			cmd.Env = []string{}
+		}
+		cfg.Runner = server.NewStdioRunner(cmd, server.Implementation{
+			Name:    "d8a-server",
+			Title:   "d8a Server",
+			Version: core.Version,
+		}, log)
 	}
 
 	// Catch SIGINT (Ctrl-C) and SIGTERM (systemd / kill) so the
