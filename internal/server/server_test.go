@@ -183,7 +183,13 @@ func TestMCP_RejectsBadProtocolVersion(t *testing.T) {
 	}
 }
 
-func TestMCP_AuthorizedReaches501Placeholder(t *testing.T) {
+// Once the middleware stack accepts a GET /mcp, the underlying
+// handler returns 405 because we don't open an SSE stream here (the
+// MCP Streamable HTTP spec explicitly allows this response). This
+// test confirms the middleware *runs* to completion — the rejection
+// codes for bad origin (above), bad version (above), and missing
+// auth (above) are all detected *before* this handler would run.
+func TestMCP_GetReturns405AfterMiddleware(t *testing.T) {
 	base, teardown := startTestServer(t, mcpTestOpts(t))
 	defer teardown()
 
@@ -197,10 +203,7 @@ func TestMCP_AuthorizedReaches501Placeholder(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusNotImplemented {
-		t.Fatalf("status = %d, want 501 (placeholder)", resp.StatusCode)
-	}
-	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
-		t.Fatalf("Content-Type = %q, want application/json...", ct)
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405 (no SSE stream offered)", resp.StatusCode)
 	}
 }

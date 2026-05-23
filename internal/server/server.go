@@ -7,7 +7,6 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -43,13 +42,24 @@ type Config struct {
 	// Required when the /mcp endpoint is exposed; if nil, /mcp will
 	// uniformly return 401 (the safe failure mode).
 	Validator Validator
+
+	// ServerVersion is reported as serverInfo.version in MCP
+	// initialize responses. cmd/server wires this in from
+	// internal/core so the server package stays free of the
+	// dependency.
+	ServerVersion string
+
+	// Sessions is the SessionStore implementation. If nil, an
+	// InMemorySessionStore is constructed in New.
+	Sessions SessionStore
 }
 
 // Server is the d8a-server runtime. Construct with New, then call Run.
 type Server struct {
-	cfg  Config
-	log  *slog.Logger
-	http *http.Server
+	cfg      Config
+	log      *slog.Logger
+	http     *http.Server
+	sessions SessionStore
 }
 
 // New constructs a Server. Defaults are applied to cfg before use.
@@ -58,7 +68,14 @@ func New(cfg Config, log *slog.Logger) *Server {
 		cfg.ListenAddr = DefaultListenAddr
 	}
 
-	s := &Server{cfg: cfg, log: log}
+	s := &Server{
+		cfg:      cfg,
+		log:      log,
+		sessions: cfg.Sessions,
+	}
+	if s.sessions == nil {
+		s.sessions = NewInMemorySessionStore()
+	}
 
 	mux := http.NewServeMux()
 	s.routes(mux)
@@ -73,22 +90,24 @@ func New(cfg Config, log *slog.Logger) *Server {
 
 // routes registers HTTP routes on mux.
 //
-// /healthz is a public liveness probe — no auth, no middleware. /mcp
-// is the placeholder for the MCP Streamable HTTP endpoint, guarded by
-// the full middleware stack so M2's behavior can be exercised before
-// any MCP logic exists. Middleware order is intentional: cheapest
-// rejections first.
+// /healthz is an unauthenticated liveness probe. /mcp (POST/GET/DELETE)
+// is the MCP Streamable HTTP endpoint, guarded by the full middleware
+// chain. Middleware order is intentional: cheapest rejections first
+// (Origin, then protocol version, then bearer validation).
 func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 
-	mcp := Chain(
-		http.HandlerFunc(s.handleMCPPlaceholder),
-		RequireOrigin(s.cfg.AllowedOrigins, s.log),
-		ParseProtocolVersion(),
-		RequireAuth(s.cfg.Validator, s.cfg.Audience, s.log),
-	)
-	mux.Handle("POST /mcp", mcp)
-	mux.Handle("GET /mcp", mcp)
+	mcpChain := func(h http.HandlerFunc) http.Handler {
+		return Chain(
+			h,
+			RequireOrigin(s.cfg.AllowedOrigins, s.log),
+			ParseProtocolVersion(),
+			RequireAuth(s.cfg.Validator, s.cfg.Audience, s.log),
+		)
+	}
+	mux.Handle("POST /mcp", mcpChain(s.handleMCPPost))
+	mux.Handle("GET /mcp", mcpChain(s.handleMCPGet))
+	mux.Handle("DELETE /mcp", mcpChain(s.handleMCPDelete))
 }
 
 // handleHealthz is a basic liveness probe — proves the process is up
@@ -98,24 +117,6 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok\n"))
-}
-
-// handleMCPPlaceholder runs after the middleware stack has accepted a
-// request. M3 will replace it with the real initialize handshake.
-// For now it returns 501 with a small JSON body that echoes the
-// resolved identity and protocol version, so a hands-on smoke test
-// can verify each middleware did its job.
-func (s *Server) handleMCPPlaceholder(w http.ResponseWriter, r *http.Request) {
-	id, _ := IdentityFromContext(r.Context())
-	v, _ := ProtocolVersionFromContext(r.Context())
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusNotImplemented)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"error":           "mcp endpoint not yet implemented",
-		"note":            "initialize handshake lands in milestone 3",
-		"subject":         id.Subject,
-		"protocolVersion": v,
-	})
 }
 
 // shutdownTimeout caps how long graceful shutdown is allowed to wait
@@ -128,9 +129,6 @@ const shutdownTimeout = 10 * time.Second
 func (s *Server) Run(ctx context.Context) error {
 	s.log.Info("listening", "addr", s.cfg.ListenAddr)
 
-	// ListenAndServe blocks; run it on a goroutine so we can also wait
-	// on ctx in this function. The buffered channel reports the listener
-	// error (or nil if Shutdown closed it normally).
 	serveErr := make(chan error, 1)
 	go func() {
 		err := s.http.ListenAndServe()
@@ -142,7 +140,6 @@ func (s *Server) Run(ctx context.Context) error {
 
 	select {
 	case err := <-serveErr:
-		// Listener exited on its own (e.g. bind error).
 		return err
 	case <-ctx.Done():
 		s.log.Info("shutting down")
@@ -151,7 +148,6 @@ func (s *Server) Run(ctx context.Context) error {
 		if err := s.http.Shutdown(shutdownCtx); err != nil {
 			return err
 		}
-		// Drain the serve goroutine to ensure a clean exit.
 		return <-serveErr
 	}
 }

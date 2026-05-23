@@ -65,6 +65,7 @@ func main() {
 		Audience:       fc.Audience,
 		AllowedOrigins: fc.AllowedOrigins,
 		Validator:      validator,
+		ServerVersion:  core.Version,
 	}
 
 	// Catch SIGINT (Ctrl-C) and SIGTERM (systemd / kill) so the
