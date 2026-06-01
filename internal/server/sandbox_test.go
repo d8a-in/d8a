@@ -8,12 +8,30 @@ import (
 	"testing"
 )
 
-// requireBwrap skips the test if bwrap isn't installed on the host.
-// Used by integration-style tests that actually exec under sandbox.
+// requireBwrap skips the test if bwrap isn't installed *or* can't
+// actually unshare in this environment. The latter happens on
+// hardened distros that restrict unprivileged user namespaces
+// (Ubuntu 24.04 default, GitHub Actions runners, some container
+// environments) — bwrap is on PATH but every invocation fails at
+// the namespace-setup stage.
+//
+// We probe with a minimal "unshare and exit 0" invocation so a
+// broken environment skips cleanly instead of producing 3+ confusing
+// FAIL lines.
 func requireBwrap(t *testing.T) {
 	t.Helper()
 	if !SandboxAvailable() {
 		t.Skip("bwrap not installed; skipping integration sandbox test")
+	}
+	probe := exec.Command("bwrap",
+		"--unshare-pid", "--unshare-ipc", "--unshare-uts",
+		"--die-with-parent",
+		"--proc", "/proc", "--dev", "/dev",
+		"--ro-bind", "/usr", "/usr",
+		"/usr/bin/true")
+	if out, err := probe.CombinedOutput(); err != nil {
+		t.Skipf("bwrap installed but cannot unshare in this environment "+
+			"(likely apparmor/userns restrictions): %v\noutput: %s", err, out)
 	}
 }
 
