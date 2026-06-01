@@ -59,6 +59,19 @@ type FileConfig struct {
 	// SweepIntervalSeconds is how often the GC goroutine wakes
 	// (Zero = DefaultSweepInterval, 1m).
 	SweepIntervalSeconds int `json:"sweepIntervalSeconds,omitempty"`
+
+	// RateLimit configures per-identity request rate limiting.
+	// nil / omitted = no limiting.
+	RateLimit *FileRateLimit `json:"rateLimit,omitempty"`
+}
+
+// FileRateLimit is the on-disk JSON shape for the RateLimit config
+// block. Durations are expressed in seconds (integer) so the JSON
+// stays human-readable; convert to time.Duration in main.
+type FileRateLimit struct {
+	RequestsPerSecond float64 `json:"requestsPerSecond,omitempty"`
+	Burst             float64 `json:"burst,omitempty"`
+	EvictAfterSeconds int     `json:"evictAfterSeconds,omitempty"`
 }
 
 // BackendConfig describes the subprocess to spawn as the backing MCP.

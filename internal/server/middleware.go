@@ -2,9 +2,11 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // contextKey is unexported so other packages cannot collide with our
@@ -132,6 +134,60 @@ func extractBearer(header string) (string, bool) {
 func respondUnauthorized(w http.ResponseWriter) {
 	w.Header().Set("WWW-Authenticate", `Bearer realm="d8a"`)
 	http.Error(w, "unauthorized", http.StatusUnauthorized)
+}
+
+// RequireRateLimit returns middleware that consumes one token from
+// the rate limiter for the authenticated identity per request. On
+// empty bucket the request is rejected with HTTP 429 + a JSON-RPC
+// error body (id=null, since rate limiting is decided before parsing
+// the request payload).
+//
+// A nil limiter is a no-op: handlers wired with RequireRateLimit(nil,
+// log) behave exactly as if the middleware weren't present, so
+// rate limiting can be enabled/disabled by config without a routing
+// change.
+func RequireRateLimit(l *RateLimiter, log *slog.Logger) Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if l == nil {
+				next.ServeHTTP(w, r)
+				return
+			}
+			id, ok := IdentityFromContext(r.Context())
+			if !ok || id.Subject == "" {
+				// Pre-auth path (or anonymous). Auth middleware
+				// should have rejected; if it didn't, we can't
+				// rate limit a missing subject — let through.
+				next.ServeHTTP(w, r)
+				return
+			}
+			if !l.Allow(time.Now(), id.Subject) {
+				log.Info("rate limited",
+					"subject", id.Subject, "path", r.URL.Path)
+				respondRateLimited(w)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// respondRateLimited writes the HTTP 429 + JSON-RPC error body that
+// represents a throttled request. Retry-After is the conservative
+// "try again in a second" value — clients with their own backoff
+// will refine.
+func respondRateLimited(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", "1")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusTooManyRequests)
+	_ = json.NewEncoder(w).Encode(JSONRPCMessage{
+		JSONRPC: jsonrpcVersion,
+		ID:      json.RawMessage("null"),
+		Error: &JSONRPCError{
+			Code:    -32000,
+			Message: "rate limited",
+		},
+	})
 }
 
 // SupportedProtocolVersions is the set of MCP protocol versions this

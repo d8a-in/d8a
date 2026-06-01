@@ -73,6 +73,16 @@ func main() {
 		IdleTimeout:    time.Duration(fc.IdleTimeoutSeconds) * time.Second,
 		SweepInterval:  time.Duration(fc.SweepIntervalSeconds) * time.Second,
 	}
+	if fc.RateLimit != nil {
+		cfg.RateLimit = server.RateLimit{
+			RequestsPerSecond: fc.RateLimit.RequestsPerSecond,
+			Burst:             fc.RateLimit.Burst,
+			EvictAfter:        time.Duration(fc.RateLimit.EvictAfterSeconds) * time.Second,
+		}
+		log.Info("rate limit configured",
+			"rps", cfg.RateLimit.RequestsPerSecond,
+			"burst", cfg.RateLimit.Burst)
+	}
 	if cfg.Catalog != nil {
 		log.Info("capability catalog loaded", "bundles", len(fc.Capabilities))
 	} else {

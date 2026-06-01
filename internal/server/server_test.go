@@ -21,6 +21,7 @@ type testServerOpts struct {
 	catalog        *Catalog
 	idleTimeout    time.Duration
 	sweepInterval  time.Duration
+	rateLimit      RateLimit
 }
 
 // pickAddr returns a free loopback address. There is a small race
@@ -55,6 +56,7 @@ func startTestServer(t *testing.T, opts testServerOpts) (baseURL string, teardow
 		Catalog:        opts.catalog,
 		IdleTimeout:    opts.idleTimeout,
 		SweepInterval:  opts.sweepInterval,
+		RateLimit:      opts.rateLimit,
 	}, log)
 
 	ctx, cancel := context.WithCancel(context.Background())

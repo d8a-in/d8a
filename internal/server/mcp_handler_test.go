@@ -643,6 +643,88 @@ func TestCatalog_WildcardScopeGrantsEverything(t *testing.T) {
 	}
 }
 
+// ----- rate limiting (M9) -----
+
+func TestRateLimit_ThrottlesAfterBurstExhausted(t *testing.T) {
+	// burst=2: the first two POSTs to /mcp succeed (auth + bearer
+	// + a JSON-RPC error from the parse path is fine — the rate
+	// limit is what we care about), the third should be 429.
+	opts := mcpTestOpts(t)
+	opts.rateLimit = RateLimit{
+		RequestsPerSecond: 0.01, // refill so slow it's effectively unrefilled within the test
+		Burst:             2,
+	}
+	base, teardown := startTestServer(t, opts)
+	defer teardown()
+
+	// Use a body that bypasses the JSON-RPC initialize path — the
+	// rate limiter runs as middleware *before* the handler. Even an
+	// invalid body counts against the token bucket because the
+	// middleware fires first.
+	body := `{"jsonrpc":"2.0","id":1,"method":"ping"}`
+
+	// First two: should NOT be 429.
+	for i := 0; i < 2; i++ {
+		resp := mcpPost(t, base, "secret", "ignored-session", body)
+		if resp.StatusCode == http.StatusTooManyRequests {
+			resp.Body.Close()
+			t.Fatalf("request #%d unexpectedly 429 (burst should permit 2)", i+1)
+		}
+		resp.Body.Close()
+	}
+
+	// Third: must be 429 with retry-after.
+	resp := mcpPost(t, base, "secret", "ignored-session", body)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429 once burst is exhausted", resp.StatusCode)
+	}
+	if resp.Header.Get("Retry-After") == "" {
+		t.Errorf("expected Retry-After header on 429")
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+}
+
+func TestRateLimit_IsPerIdentity(t *testing.T) {
+	// Two API keys, two subjects. Alice exhausts her bucket; Bob's
+	// independent bucket should still permit a request.
+	const audience = "http://aud.example/mcp"
+	v, err := NewAPIKeyValidator([]APIKey{
+		{TokenHashHex: HashToken("alice-key"), Audience: audience, Subject: "alice"},
+		{TokenHashHex: HashToken("bob-key"), Audience: audience, Subject: "bob"},
+	})
+	if err != nil {
+		t.Fatalf("validator: %v", err)
+	}
+	base, teardown := startTestServer(t, testServerOpts{
+		validator: v,
+		audience:  audience,
+		rateLimit: RateLimit{RequestsPerSecond: 0.01, Burst: 1},
+	})
+	defer teardown()
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"ping"}`
+
+	// Alice's first request consumes her token; second is 429.
+	r1 := mcpPost(t, base, "alice-key", "sid", body)
+	r1.Body.Close()
+	r2 := mcpPost(t, base, "alice-key", "sid", body)
+	if r2.StatusCode != http.StatusTooManyRequests {
+		r2.Body.Close()
+		t.Fatalf("alice's second call = %d, want 429", r2.StatusCode)
+	}
+	r2.Body.Close()
+
+	// Bob shares NO state with alice — his first call must succeed.
+	rBob := mcpPost(t, base, "bob-key", "sid", body)
+	defer rBob.Body.Close()
+	if rBob.StatusCode == http.StatusTooManyRequests {
+		t.Fatalf("bob throttled by alice's bucket — limiter is leaking across identities")
+	}
+}
+
 func TestCatalog_PermissiveWhenNoCatalog(t *testing.T) {
 	// Regression: pre-M6 behavior — no catalog configured means
 	// every authenticated identity has access to every tool the

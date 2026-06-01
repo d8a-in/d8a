@@ -80,6 +80,11 @@ type Config struct {
 	// for expired sessions. The zero value applies a sensible
 	// default (DefaultSweepInterval).
 	SweepInterval time.Duration
+
+	// RateLimit configures per-identity request rate limiting at
+	// the /mcp endpoint. Zero RequestsPerSecond disables limiting
+	// — see brainstorming #103 for the design.
+	RateLimit RateLimit
 }
 
 // DefaultIdleTimeout is the session-GC idle threshold applied when
@@ -112,6 +117,9 @@ type Server struct {
 	// catalog filters per-identity what each session sees and can
 	// call. nil = no catalog → permissive mode.
 	catalog *Catalog
+
+	// limiter throttles per identity. nil = rate limiting disabled.
+	limiter *RateLimiter
 }
 
 // New constructs a Server. Defaults are applied to cfg before use.
@@ -125,6 +133,7 @@ func New(cfg Config, log *slog.Logger) *Server {
 		log:      log,
 		sessions: cfg.Sessions,
 		catalog:  cfg.Catalog,
+		limiter:  NewRateLimiter(cfg.RateLimit),
 	}
 	if s.sessions == nil {
 		s.sessions = NewInMemorySessionStore()
@@ -156,6 +165,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 			RequireOrigin(s.cfg.AllowedOrigins, s.log),
 			ParseProtocolVersion(),
 			RequireAuth(s.cfg.Validator, s.cfg.Audience, s.log),
+			RequireRateLimit(s.limiter, s.log),
 		)
 	}
 	mux.Handle("POST /mcp", mcpChain(s.handleMCPPost))
@@ -182,21 +192,33 @@ func (s *Server) idleAndSweep() (idle, sweep time.Duration) {
 }
 
 // runSessionGC periodically sweeps the SessionStore for sessions
-// idle longer than the configured timeout. It exits when ctx is
-// canceled.
+// idle longer than the configured timeout, and the rate limiter
+// for per-identity buckets that haven't been touched recently. Both
+// share the same ticker — they run at the same cadence and have
+// the same lifecycle. Exits when ctx is canceled.
 func (s *Server) runSessionGC(ctx context.Context, idle, sweep time.Duration) {
-	s.log.Info("session GC enabled", "idle_timeout", idle, "sweep_interval", sweep)
+	s.log.Info("background GC enabled",
+		"session_idle_timeout", idle,
+		"sweep_interval", sweep,
+		"rate_limiter_active", s.limiter != nil)
 	ticker := time.NewTicker(sweep)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			cutoff := time.Now().Add(-idle)
-			if n := s.sessions.ExpireBefore(cutoff); n > 0 {
+		case now := <-ticker.C:
+			if n := s.sessions.ExpireBefore(now.Add(-idle)); n > 0 {
 				s.log.Info("expired idle sessions",
 					"count", n, "idle_timeout", idle)
+			}
+			if s.limiter != nil {
+				// Rate-limiter buckets evict at their own
+				// configured cadence (RateLimit.EvictAfter) —
+				// the limiter knows its own policy.
+				if n := s.limiter.Cleanup(now.Add(-s.cfg.RateLimit.EvictAfter)); n > 0 {
+					s.log.Debug("evicted idle rate-limit buckets", "count", n)
+				}
 			}
 		}
 	}
