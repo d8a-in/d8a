@@ -8,6 +8,12 @@ on:
 permissions:
   contents: read
 
+# Opt in early to Node 24 for JavaScript-based actions. GitHub is
+# forcing this default on 2026-06-16 anyway; setting it now silences
+# the deprecation warning on every run.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   test:
     name: vet · gofmt · test -race · build
@@ -18,7 +24,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26"
-          cache: true
+          # No third-party dependencies yet, so there's nothing to
+          # cache. Re-enable when we add a go.sum.
+          cache: false
 
       - name: go vet
         run: go vet ./...
