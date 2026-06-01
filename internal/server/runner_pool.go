@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os/exec"
 	"sync"
+	"time"
 )
 
 // Backend is the factory data for spawning a backing MCP. It captures
@@ -96,6 +97,11 @@ type pooledInstance struct {
 	startOnce sync.Once
 	startErr  error
 	started   bool
+
+	// lastUsed is the time of the most recent RunnerFor() lookup
+	// for this instance. Updated under the pool's mu. Consulted by
+	// EvictIdle to decide whether the instance has gone cold.
+	lastUsed time.Time
 }
 
 // NewRunnerPool constructs a pool for the given backend. shareSafe
@@ -209,6 +215,10 @@ func (p *RunnerPool) RunnerFor(ctx context.Context, identity Identity) (Runner, 
 		p.instances[key] = inst
 		p.log.Info("spawning new backing mcp for partition", "key", key)
 	}
+	// Updating lastUsed on every lookup (even when the instance
+	// already existed) is intentional — that's what keeps an
+	// actively-used instance from being reaped by EvictIdle.
+	inst.lastUsed = time.Now()
 	p.mu.Unlock()
 
 	// sync.Once means the FIRST goroutine to reach a fresh inst
@@ -246,6 +256,53 @@ func (p *RunnerPool) Size() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.instances)
+}
+
+// EvictIdle stops every per-identity Runner whose last use is
+// strictly before cutoff and removes it from the pool. The shared
+// runner under sharedKey is never evicted — it serves all
+// identities in share-safe mode. Returns the count of evictions.
+//
+// Called periodically by the server's background GC goroutine
+// alongside session expiry. The next RunnerFor for an evicted
+// partition lazily spawns a fresh Runner — at the cost of one
+// new subprocess startup.
+func (p *RunnerPool) EvictIdle(cutoff time.Time) int {
+	if p == nil {
+		return 0
+	}
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return 0
+	}
+	// Collect targets under lock; stop subprocesses outside the
+	// lock so a slow Stop() doesn't block other pool operations.
+	type victim struct {
+		key  string
+		inst *pooledInstance
+	}
+	var victims []victim
+	for key, inst := range p.instances {
+		if key == sharedKey {
+			continue
+		}
+		if inst.lastUsed.Before(cutoff) {
+			victims = append(victims, victim{key: key, inst: inst})
+			delete(p.instances, key)
+		}
+	}
+	p.mu.Unlock()
+
+	for _, v := range victims {
+		if v.inst.started {
+			if err := v.inst.runner.Stop(); err != nil {
+				p.log.Warn("evicted runner stop failed",
+					"key", v.key, "err", err)
+			}
+		}
+	}
+	return len(victims)
 }
 
 // Close stops every live Runner in the pool. After Close, RunnerFor

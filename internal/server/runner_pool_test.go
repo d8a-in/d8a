@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // fakeRunner is an in-process Runner implementation used for
@@ -260,6 +261,77 @@ func TestRunnerPool_PartitionKey(t *testing.T) {
 	isolate := NewRunnerPool(Backend{}, false, newRunnerLogger())
 	if k := isolate.PartitionKey(Identity{Subject: "alice"}); k != "subj:alice" {
 		t.Errorf("isolate partition key = %q, want subj:alice", k)
+	}
+}
+
+func TestRunnerPool_EvictIdleRemovesColdInstances(t *testing.T) {
+	// Build a real RunnerPool in isolate mode with a fake-backed
+	// factory and exercise EvictIdle directly. We rely on a fake
+	// Backend.Build by NOT calling Start (which would exec a
+	// real subprocess); instead we hand-craft pooledInstance
+	// entries via the pool's internals would require unexported
+	// access, so instead we exercise via the production code path
+	// using a Backend that builds in-process fakeRunners.
+	//
+	// To keep this purely-Go (no subprocess), we directly populate
+	// p.instances. That's whitebox but inside the same package, so
+	// it's a legitimate unit test.
+	p := NewRunnerPool(Backend{}, false, newRunnerLogger())
+
+	old := time.Now().Add(-1 * time.Hour)
+	fresh := time.Now()
+
+	colors := []struct {
+		key      string
+		lastUsed time.Time
+	}{
+		{"subj:alice", old},
+		{"subj:bob", fresh},
+		{sharedKey, old}, // SHOULD NOT be evicted even though "old"
+	}
+	for _, c := range colors {
+		p.instances[c.key] = &pooledInstance{
+			runner:   &fakeRunner{id: c.key},
+			started:  true,
+			lastUsed: c.lastUsed,
+		}
+		// Pre-fire startOnce so EvictIdle's Stop call is reached.
+		p.instances[c.key].startOnce.Do(func() {})
+	}
+
+	cutoff := time.Now().Add(-30 * time.Minute)
+	if got := p.EvictIdle(cutoff); got != 1 {
+		t.Errorf("EvictIdle = %d, want 1 (alice only; bob fresh; shared protected)", got)
+	}
+	if _, ok := p.instances["subj:alice"]; ok {
+		t.Errorf("alice should have been evicted")
+	}
+	if _, ok := p.instances["subj:bob"]; !ok {
+		t.Errorf("bob (fresh) wrongly evicted")
+	}
+	if _, ok := p.instances[sharedKey]; !ok {
+		t.Errorf("shared runner wrongly evicted — it must be exempt regardless of lastUsed")
+	}
+}
+
+func TestRunnerPool_EvictIdleOnClosedIsNoop(t *testing.T) {
+	p := NewRunnerPool(Backend{}, false, newRunnerLogger())
+	p.instances["subj:alice"] = &pooledInstance{
+		runner:   &fakeRunner{id: "alice"},
+		started:  true,
+		lastUsed: time.Now().Add(-1 * time.Hour),
+	}
+	p.instances["subj:alice"].startOnce.Do(func() {})
+	_ = p.Close()
+	if got := p.EvictIdle(time.Now()); got != 0 {
+		t.Errorf("EvictIdle on closed pool = %d, want 0", got)
+	}
+}
+
+func TestRunnerPool_NilEvictIdleIsZero(t *testing.T) {
+	var p *RunnerPool
+	if got := p.EvictIdle(time.Now()); got != 0 {
+		t.Errorf("nil pool EvictIdle = %d, want 0", got)
 	}
 }
 

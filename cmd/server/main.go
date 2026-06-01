@@ -63,14 +63,15 @@ func main() {
 	}
 
 	cfg := server.Config{
-		ListenAddr:     fc.Listen,
-		Audience:       fc.Audience,
-		AllowedOrigins: fc.AllowedOrigins,
-		Validator:      validator,
-		ServerVersion:  core.Version,
-		Catalog:        server.NewCatalog(fc.Capabilities),
-		IdleTimeout:    time.Duration(fc.IdleTimeoutSeconds) * time.Second,
-		SweepInterval:  time.Duration(fc.SweepIntervalSeconds) * time.Second,
+		ListenAddr:      fc.Listen,
+		Audience:        fc.Audience,
+		AllowedOrigins:  fc.AllowedOrigins,
+		Validator:       validator,
+		ServerVersion:   core.Version,
+		Catalog:         server.NewCatalog(fc.Capabilities),
+		IdleTimeout:     time.Duration(fc.IdleTimeoutSeconds) * time.Second,
+		SweepInterval:   time.Duration(fc.SweepIntervalSeconds) * time.Second,
+		PoolIdleTimeout: time.Duration(fc.PoolIdleTimeoutSeconds) * time.Second,
 	}
 	if fc.RateLimit != nil {
 		cfg.RateLimit = server.RateLimit{

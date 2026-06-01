@@ -95,7 +95,21 @@ type Config struct {
 	// the /mcp endpoint. Zero RequestsPerSecond disables limiting
 	// — see brainstorming #103 for the design.
 	RateLimit RateLimit
+
+	// PoolIdleTimeout controls how long a per-identity backing
+	// Runner can sit unused in the pool before being stopped and
+	// reaped. Only meaningful in isolate mode (the shared runner
+	// is never evicted). Zero applies a default of 15 minutes; a
+	// negative value disables pool eviction.
+	PoolIdleTimeout time.Duration
 }
+
+// DefaultPoolIdleTimeout is the per-identity pool-eviction default
+// applied when Config.PoolIdleTimeout is zero. 15 minutes is long
+// enough that a user idle-thinking between tool calls doesn't pay
+// for re-spawning every time, short enough that a one-off connector
+// doesn't keep a subprocess alive for hours.
+const DefaultPoolIdleTimeout = 15 * time.Minute
 
 // DefaultIdleTimeout is the session-GC idle threshold applied when
 // Config.IdleTimeout is zero. Half an hour balances "drop forgotten
@@ -209,16 +223,20 @@ func (s *Server) idleAndSweep() (idle, sweep time.Duration) {
 	return idle, sweep
 }
 
-// runSessionGC periodically sweeps the SessionStore for sessions
-// idle longer than the configured timeout, and the rate limiter
-// for per-identity buckets that haven't been touched recently. Both
-// share the same ticker — they run at the same cadence and have
-// the same lifecycle. Exits when ctx is canceled.
+// runSessionGC periodically sweeps three idle-data stores at a
+// single cadence: the SessionStore for expired sessions, the rate
+// limiter for unused buckets, and the runner pool for cold
+// per-identity backing MCPs. One ticker, three jobs.
+//
+// Exits when ctx is canceled. Each job is bypassed cleanly when
+// its corresponding feature is disabled / nil.
 func (s *Server) runSessionGC(ctx context.Context, idle, sweep time.Duration) {
+	poolIdle := s.poolIdleTimeout()
 	s.log.Info("background GC enabled",
 		"session_idle_timeout", idle,
 		"sweep_interval", sweep,
-		"rate_limiter_active", s.limiter != nil)
+		"rate_limiter_active", s.limiter != nil,
+		"pool_idle_timeout", poolIdle)
 	ticker := time.NewTicker(sweep)
 	defer ticker.Stop()
 	for {
@@ -231,14 +249,31 @@ func (s *Server) runSessionGC(ctx context.Context, idle, sweep time.Duration) {
 					"count", n, "idle_timeout", idle)
 			}
 			if s.limiter != nil {
-				// Rate-limiter buckets evict at their own
-				// configured cadence (RateLimit.EvictAfter) —
-				// the limiter knows its own policy.
 				if n := s.limiter.Cleanup(now.Add(-s.cfg.RateLimit.EvictAfter)); n > 0 {
 					s.log.Debug("evicted idle rate-limit buckets", "count", n)
 				}
 			}
+			if s.pool != nil && poolIdle > 0 {
+				if n := s.pool.EvictIdle(now.Add(-poolIdle)); n > 0 {
+					s.log.Info("evicted idle pool runners",
+						"count", n, "idle_timeout", poolIdle)
+				}
+			}
 		}
+	}
+}
+
+// poolIdleTimeout resolves Config.PoolIdleTimeout into its effective
+// value. Zero → DefaultPoolIdleTimeout; negative → 0 (disabled).
+func (s *Server) poolIdleTimeout() time.Duration {
+	t := s.cfg.PoolIdleTimeout
+	switch {
+	case t < 0:
+		return 0
+	case t == 0:
+		return DefaultPoolIdleTimeout
+	default:
+		return t
 	}
 }
 

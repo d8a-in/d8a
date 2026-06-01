@@ -63,6 +63,12 @@ type FileConfig struct {
 	// RateLimit configures per-identity request rate limiting.
 	// nil / omitted = no limiting.
 	RateLimit *FileRateLimit `json:"rateLimit,omitempty"`
+
+	// PoolIdleTimeoutSeconds controls how long a per-identity
+	// backing MCP can sit unused in the pool before being stopped
+	// (isolate mode only). Zero applies DefaultPoolIdleTimeout
+	// (15 minutes); negative disables eviction.
+	PoolIdleTimeoutSeconds int `json:"poolIdleTimeoutSeconds,omitempty"`
 }
 
 // FileRateLimit is the on-disk JSON shape for the RateLimit config
