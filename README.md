@@ -52,3 +52,7 @@ Want the paid features? See [d8a.in](https://d8a.in).
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). All commits must be DCO-signed (`git commit -s`).
+
+## Security
+
+Found a vulnerability? See [SECURITY.md](SECURITY.md). Reports go to **security@d8a.in**, not to the public issue tracker.

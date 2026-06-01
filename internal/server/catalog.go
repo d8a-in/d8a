@@ -1,5 +1,10 @@
 package server
 
+import (
+	"path"
+	"strings"
+)
+
 // CapabilityBundle is one entry in the catalog: a named set of MCP
 // tool/resource/prompt identifiers the bundle's owners are allowed
 // to use. Use the literal "*" to mean "every name in this category."
@@ -81,29 +86,74 @@ func (c *Catalog) Resolve(scopes []string) EffectiveAccess {
 	return ea
 }
 
-// AllowsTool reports whether the given tool name is granted.
-// The literal "*" in the bundle means every tool is allowed.
+// AllowsTool reports whether the given tool name is granted. Patterns
+// in the bundle are matched against name using globPatternMatches:
+// the literal "*" matches anything; patterns containing wildcard
+// characters use Go's path.Match (so "prefix*" matches anything
+// starting with prefix, "*" within a path segment doesn't cross /);
+// everything else is exact-match.
 func (e EffectiveAccess) AllowsTool(name string) bool {
 	if e.Permissive {
 		return true
 	}
-	return e.Tools[name] || e.Tools["*"]
+	return anyPatternMatches(e.Tools, name)
 }
 
 // AllowsResource reports whether the given resource URI is granted.
+// Patterns work as documented on AllowsTool.
 func (e EffectiveAccess) AllowsResource(uri string) bool {
 	if e.Permissive {
 		return true
 	}
-	return e.Resources[uri] || e.Resources["*"]
+	return anyPatternMatches(e.Resources, uri)
 }
 
 // AllowsPrompt reports whether the given prompt name is granted.
+// Patterns work as documented on AllowsTool.
 func (e EffectiveAccess) AllowsPrompt(name string) bool {
 	if e.Permissive {
 		return true
 	}
-	return e.Prompts[name] || e.Prompts["*"]
+	return anyPatternMatches(e.Prompts, name)
+}
+
+// anyPatternMatches returns true iff at least one pattern in the
+// set matches name. Patterns are checked using globPatternMatches.
+func anyPatternMatches(patterns map[string]bool, name string) bool {
+	// Fast-path: exact-match literal. This handles the overwhelmingly
+	// common "tool name match" case in O(1).
+	if patterns[name] {
+		return true
+	}
+	// Slow-path: scan for any pattern that's a glob and matches.
+	for pattern := range patterns {
+		if pattern == name {
+			continue // already checked
+		}
+		if globPatternMatches(pattern, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// globPatternMatches reports whether name matches pattern.
+//
+//   - The literal "*" matches anything (broad wildcard).
+//   - A pattern containing any of *?[ uses Go's path.Match — so
+//     "customers*" matches "customers" and "customers_archive",
+//     "postgres://*" matches "postgres://anything" but NOT
+//     "postgres://a/b" (path.Match doesn't cross /).
+//   - Otherwise the pattern is treated as a literal exact-match.
+func globPatternMatches(pattern, name string) bool {
+	if pattern == "*" {
+		return true
+	}
+	if !strings.ContainsAny(pattern, "*?[") {
+		return pattern == name
+	}
+	matched, _ := path.Match(pattern, name)
+	return matched
 }
 
 // HasAnyTool reports whether the access grants at least one tool —

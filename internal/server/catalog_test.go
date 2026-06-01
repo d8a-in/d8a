@@ -113,6 +113,73 @@ func TestCatalog_HasAnyReportsCategory(t *testing.T) {
 	}
 }
 
+func TestCatalog_PrefixGlobMatches(t *testing.T) {
+	c := NewCatalog(map[string]CapabilityBundle{
+		"customer-data": {Resources: []string{"postgres://d8a_demo/customers*"}},
+	})
+	ea := c.Resolve([]string{"customer-data"})
+	for _, allowed := range []string{
+		"postgres://d8a_demo/customers",
+		"postgres://d8a_demo/customers_archive",
+	} {
+		if !ea.AllowsResource(allowed) {
+			t.Errorf("prefix glob should allow %q", allowed)
+		}
+	}
+	for _, denied := range []string{
+		"postgres://d8a_demo/orders",
+		"postgres://other_db/customers", // path.Match's * doesn't cross / — but here / appears earlier
+	} {
+		if ea.AllowsResource(denied) {
+			t.Errorf("prefix glob should deny %q", denied)
+		}
+	}
+}
+
+func TestCatalog_GlobDoesNotCrossSlash(t *testing.T) {
+	// path.Match's `*` does not cross /, which is the right semantic
+	// for URI-shaped resources: an admin granting "postgres://db/*"
+	// shouldn't accidentally grant "postgres://db/secret/table".
+	c := NewCatalog(map[string]CapabilityBundle{
+		"db-flat": {Resources: []string{"postgres://db/*"}},
+	})
+	ea := c.Resolve([]string{"db-flat"})
+	if !ea.AllowsResource("postgres://db/customers") {
+		t.Errorf("postgres://db/customers should be allowed")
+	}
+	if ea.AllowsResource("postgres://db/secret/table") {
+		t.Errorf("postgres://db/secret/table should be denied — glob must not cross /")
+	}
+}
+
+func TestCatalog_QuestionMarkMatchesSingleChar(t *testing.T) {
+	c := NewCatalog(map[string]CapabilityBundle{
+		"versioned": {Tools: []string{"query_v?"}},
+	})
+	ea := c.Resolve([]string{"versioned"})
+	if !ea.AllowsTool("query_v1") || !ea.AllowsTool("query_v9") {
+		t.Errorf("? should match a single character")
+	}
+	if ea.AllowsTool("query_v") || ea.AllowsTool("query_v10") {
+		t.Errorf("? should match exactly one character (not zero, not two)")
+	}
+}
+
+func TestCatalog_LiteralMatchUnchanged(t *testing.T) {
+	// Regression: bundles without glob characters must behave
+	// exactly like exact-match (no surprise matches).
+	c := NewCatalog(map[string]CapabilityBundle{
+		"echo-only": {Tools: []string{"echo"}},
+	})
+	ea := c.Resolve([]string{"echo-only"})
+	if !ea.AllowsTool("echo") {
+		t.Errorf("literal 'echo' must still match exactly")
+	}
+	if ea.AllowsTool("echoes") || ea.AllowsTool("ech") {
+		t.Errorf("literal 'echo' must NOT match similar names")
+	}
+}
+
 func TestCatalog_BundleSnapshotIsIndependent(t *testing.T) {
 	// Mutating the bundle map we passed in must not change the
 	// catalog's internal copy.
