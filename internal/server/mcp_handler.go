@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -435,11 +437,108 @@ func filterListResult(raw json.RawMessage, listKey string, allow func(string) bo
 	return json.Marshal(obj)
 }
 
-// handleMCPGet responds to GET /mcp. The spec lets us open an SSE
-// stream for server-initiated messages — but M3 doesn't initiate
-// any, so we return 405 (the spec explicitly allows this).
-func (s *Server) handleMCPGet(w http.ResponseWriter, _ *http.Request) {
-	http.Error(w, "SSE stream not offered at this endpoint", http.StatusMethodNotAllowed)
+// handleMCPGet responds to GET /mcp.
+//
+// Per the Streamable HTTP spec, a client that wants server-initiated
+// messages opens an SSE stream by sending GET with
+// `Accept: text/event-stream`. We honor that with an open stream,
+// a priming event (so clients learn the event id format and can
+// reconnect with Last-Event-ID), and periodic SSE comment-line
+// keepalives so the connection survives idle proxies.
+//
+// Routing backing-MCP-initiated notifications onto per-session
+// streams is a later milestone — for now the stream stays open
+// and quiet, which is enough for clients that subscribe by reflex
+// without depending on it for liveness.
+//
+// Clients that did NOT ask for SSE get the spec-allowed 405 — the
+// older behavior, preserved for callers and tests that hit the
+// endpoint without the right Accept header.
+func (s *Server) handleMCPGet(w http.ResponseWriter, r *http.Request) {
+	if !acceptsSSE(r.Header.Get("Accept")) {
+		http.Error(w, "SSE not requested (use Accept: text/event-stream)",
+			http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Session validation mirrors POST /mcp: header required, session
+	// must exist and belong to this identity. Hijack defense
+	// (brainstorming #120) applies here too — Alice can't subscribe
+	// to Bob's session.
+	sessionID := r.Header.Get("MCP-Session-Id")
+	if sessionID == "" {
+		http.Error(w, "MCP-Session-Id header required", http.StatusBadRequest)
+		return
+	}
+	sess, ok := s.sessions.Get(sessionID)
+	if !ok {
+		http.Error(w, "session not found", http.StatusNotFound)
+		return
+	}
+	identity, _ := IdentityFromContext(r.Context())
+	if sess.Subject != identity.Subject {
+		http.Error(w, "session does not belong to this identity", http.StatusForbidden)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		// stdlib net/http always implements Flusher; this branch
+		// is defensive against custom ResponseWriter wrappers.
+		http.Error(w, "streaming not supported on this connection", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	// Disable proxy buffering — relevant when traffic flows through
+	// nginx or similar without explicit chunked-transfer support.
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+
+	// Priming event per the Streamable HTTP spec: send an event id
+	// with an empty data field so the client knows the id format
+	// and can resume with Last-Event-ID after a disconnect.
+	if _, err := fmt.Fprintf(w, "id: %s-0\ndata: \n\n", sessionID); err != nil {
+		return
+	}
+	flusher.Flush()
+
+	s.runSSEKeepalive(r.Context(), w, flusher)
+}
+
+// acceptsSSE reports whether the Accept header value includes the
+// SSE media type. We're permissive about other values being present
+// (e.g. "application/json, text/event-stream").
+func acceptsSSE(accept string) bool {
+	return accept != "" && strings.Contains(accept, "text/event-stream")
+}
+
+// sseKeepaliveInterval is how often handleMCPGet emits an SSE
+// comment-line keepalive (lines starting with ":" are ignored by
+// clients per the SSE spec). 25s is well under the typical 30s
+// idle timeout for HTTP intermediaries.
+//
+// Exposed as a var so a test can shorten it.
+var sseKeepaliveInterval = 25 * time.Second
+
+// runSSEKeepalive loops emitting keepalive comments until the
+// client disconnects (ctx canceled) or the response writer errors.
+func (s *Server) runSSEKeepalive(ctx context.Context, w http.ResponseWriter, flusher http.Flusher) {
+	ticker := time.NewTicker(sseKeepaliveInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if _, err := w.Write([]byte(": keepalive\n\n")); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
 }
 
 // handleMCPDelete responds to DELETE /mcp — the spec-defined way for

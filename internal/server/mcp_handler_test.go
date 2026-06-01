@@ -281,6 +281,86 @@ func TestSession_RejectsCrossIdentityAccess(t *testing.T) {
 
 // ----- GET and DELETE -----
 
+func TestGetMCP_SSE_OpensStreamWithPrimingEvent(t *testing.T) {
+	// With Accept: text/event-stream and a valid session, GET /mcp
+	// upgrades to a Streamable HTTP SSE response, returns 200,
+	// sets the right Content-Type, and writes the priming event
+	// (id: <session>-0, empty data) the spec wants.
+	base, teardown := startTestServer(t, mcpTestOpts(t))
+	defer teardown()
+
+	sid := initializeSession(t, base, "secret")
+
+	req, _ := http.NewRequest(http.MethodGet, base+"/mcp", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("MCP-Protocol-Version", "2025-11-25")
+	req.Header.Set("MCP-Session-Id", sid)
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("Content-Type = %q, want text/event-stream", ct)
+	}
+
+	// Read enough bytes to see the priming event line. The
+	// connection then closes (defer resp.Body.Close above), the
+	// server's r.Context cancels, and runSSEKeepalive returns.
+	buf := make([]byte, 256)
+	n, _ := resp.Body.Read(buf)
+	got := string(buf[:n])
+	if !strings.Contains(got, "id: "+sid+"-0") {
+		t.Errorf("priming event missing id; got: %q", got)
+	}
+	if !strings.Contains(got, "data: ") {
+		t.Errorf("priming event missing data field; got: %q", got)
+	}
+}
+
+func TestGetMCP_SSE_RequiresSessionHeader(t *testing.T) {
+	base, teardown := startTestServer(t, mcpTestOpts(t))
+	defer teardown()
+
+	req, _ := http.NewRequest(http.MethodGet, base+"/mcp", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("MCP-Protocol-Version", "2025-11-25")
+	req.Header.Set("Accept", "text/event-stream")
+	// NO MCP-Session-Id
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestGetMCP_SSE_UnknownSession(t *testing.T) {
+	base, teardown := startTestServer(t, mcpTestOpts(t))
+	defer teardown()
+
+	req, _ := http.NewRequest(http.MethodGet, base+"/mcp", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("MCP-Protocol-Version", "2025-11-25")
+	req.Header.Set("MCP-Session-Id", "definitely-not-a-real-session-id")
+	req.Header.Set("Accept", "text/event-stream")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
 func TestGetMCP_Returns405(t *testing.T) {
 	base, teardown := startTestServer(t, mcpTestOpts(t))
 	defer teardown()
