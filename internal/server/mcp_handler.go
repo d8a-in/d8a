@@ -225,6 +225,14 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request, sess *Ses
 	case "resources/read":
 		s.forwardWithNameGate(w, r, sess, msg, "uri", access.AllowsResource)
 		return
+	case "resources/templates/list":
+		// Templates share the Resources allowlist — they describe
+		// *what kind* of resources are exposed, and granting
+		// access to a resource implies the right to discover its
+		// template. Filter by name (templates have a "name" field
+		// in addition to their uriTemplate pattern).
+		s.forwardAndFilterList(w, r, sess, msg, "resourceTemplates", access.AllowsResource)
+		return
 	case "prompts/list":
 		s.forwardAndFilterList(w, r, sess, msg, "prompts", access.AllowsPrompt)
 		return

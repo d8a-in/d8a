@@ -73,6 +73,17 @@ func runFakeMCP(in io.Reader, out io.Writer) {
 				"pid": os.Getpid(),
 			})
 			_ = enc.Encode(resp)
+		case "resources/templates/list":
+			// Multiple templates so catalog tests can verify the
+			// resourceTemplates array gets filtered like other
+			// list responses.
+			resp, _ := NewResultResponse(req.ID, map[string]any{
+				"resourceTemplates": []map[string]string{
+					{"name": "public-template", "uriTemplate": "fake://public/{x}"},
+					{"name": "secret-template", "uriTemplate": "fake://secret/{x}"},
+				},
+			})
+			_ = enc.Encode(resp)
 		case "boom":
 			_ = enc.Encode(NewErrorResponse(req.ID, -32000, "boom", nil))
 		default:

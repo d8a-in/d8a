@@ -837,6 +837,64 @@ func TestRateLimit_IsPerIdentity(t *testing.T) {
 	}
 }
 
+func TestCatalog_TemplatesFilteredByResourceScope(t *testing.T) {
+	// resources/templates/list is filtered by the same Resources
+	// allowlist as resources/list. The fake exposes
+	// "public-template" and "secret-template"; a catalog granting
+	// only "public-template" must drop the secret one.
+	const audience = "http://aud.example/mcp"
+	v, err := NewAPIKeyValidator([]APIKey{{
+		TokenHashHex: HashToken("secret"),
+		Audience:     audience,
+		Subject:      "alice",
+		Scopes:       []string{"public-only"},
+	}})
+	if err != nil {
+		t.Fatalf("validator: %v", err)
+	}
+	base, teardown := startTestServer(t, testServerOpts{
+		validator: v,
+		audience:  audience,
+		runner: NewStdioRunner(fakeMCPCmd(t),
+			Implementation{Name: "d8a-server-test", Version: "0"},
+			newRunnerLogger()),
+		catalog: NewCatalog(map[string]CapabilityBundle{
+			"public-only": {Resources: []string{"public-template"}},
+		}),
+	})
+	defer teardown()
+
+	sid := initializeSession(t, base, "secret")
+	resp := mcpPost(t, base, "secret", sid,
+		`{"jsonrpc":"2.0","id":1,"method":"resources/templates/list"}`)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	msg := decodeRPC(t, resp.Body)
+	if msg.Error != nil {
+		t.Fatalf("Error = %+v", msg.Error)
+	}
+	var result struct {
+		ResourceTemplates []struct {
+			Name string `json:"name"`
+		} `json:"resourceTemplates"`
+	}
+	if err := json.Unmarshal(msg.Result, &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, rt := range result.ResourceTemplates {
+		if rt.Name == "secret-template" {
+			t.Fatalf("'secret-template' leaked through resources/templates/list; got %+v",
+				result.ResourceTemplates)
+		}
+	}
+	if len(result.ResourceTemplates) != 1 || result.ResourceTemplates[0].Name != "public-template" {
+		t.Fatalf("expected exactly [public-template]; got %+v", result.ResourceTemplates)
+	}
+}
+
 func TestCatalog_PermissiveWhenNoCatalog(t *testing.T) {
 	// Regression: pre-M6 behavior — no catalog configured means
 	// every authenticated identity has access to every tool the
