@@ -37,6 +37,14 @@ type FileConfig struct {
 	// token itself.
 	APIKeys []APIKey `json:"apiKeys,omitempty"`
 
+	// Capabilities maps scope names (used in APIKeys[].Scopes) to
+	// the bundle of MCP tool/resource/prompt identifiers each scope
+	// grants. When absent / empty, d8a-server runs in "permissive
+	// mode" (every authenticated identity has the same access as
+	// the backing MCP exposes). When present, identities see only
+	// what their resolved scopes grant — see brainstorming #123.
+	Capabilities map[string]CapabilityBundle `json:"capabilities,omitempty"`
+
 	// Backend is the optional backing MCP this server proxies for.
 	// When set, d8a-server spawns the configured command, performs
 	// its initialize handshake at startup, and forwards MCP method

@@ -23,11 +23,17 @@ func requireBwrap(t *testing.T) {
 	if !SandboxAvailable() {
 		t.Skip("bwrap not installed; skipping integration sandbox test")
 	}
+	// The probe needs enough of the host visible for `/usr/bin/true`
+	// to actually run — that means /usr (for the binary), /lib for
+	// libc, /lib64 for the dynamic linker. Match the same shape the
+	// real tests use so the probe is a faithful predictor.
 	probe := exec.Command("bwrap",
 		"--unshare-pid", "--unshare-ipc", "--unshare-uts",
 		"--die-with-parent",
 		"--proc", "/proc", "--dev", "/dev",
 		"--ro-bind", "/usr", "/usr",
+		"--ro-bind-try", "/lib", "/lib",
+		"--ro-bind-try", "/lib64", "/lib64",
 		"/usr/bin/true")
 	if out, err := probe.CombinedOutput(); err != nil {
 		t.Skipf("bwrap installed but cannot unshare in this environment "+

@@ -50,9 +50,12 @@ func runFakeMCP(in io.Reader, out io.Writer) {
 			resp, _ := NewResultResponse(req.ID, result)
 			_ = enc.Encode(resp)
 		case "tools/list":
+			// Multiple tools so catalog-filtering integration tests
+			// have something to filter out.
 			resp, _ := NewResultResponse(req.ID, map[string]any{
 				"tools": []map[string]string{
 					{"name": "echo", "description": "Echoes its params back"},
+					{"name": "secret-tool", "description": "Should be filtered by catalog tests"},
 				},
 			})
 			_ = enc.Encode(resp)
@@ -115,8 +118,16 @@ func TestStdioRunner_CallToolsList(t *testing.T) {
 	if err := json.Unmarshal(raw, &result); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if len(result.Tools) != 1 || result.Tools[0].Name != "echo" {
-		t.Fatalf("tools = %+v", result.Tools)
+	// Tolerate additional tools (the fake exposes "secret-tool" too
+	// for catalog-filter tests in mcp_handler_test.go).
+	var sawEcho bool
+	for _, t := range result.Tools {
+		if t.Name == "echo" {
+			sawEcho = true
+		}
+	}
+	if !sawEcho {
+		t.Fatalf("tools list missing 'echo'; got %+v", result.Tools)
 	}
 }
 

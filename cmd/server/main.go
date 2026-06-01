@@ -68,6 +68,12 @@ func main() {
 		AllowedOrigins: fc.AllowedOrigins,
 		Validator:      validator,
 		ServerVersion:  core.Version,
+		Catalog:        server.NewCatalog(fc.Capabilities),
+	}
+	if cfg.Catalog != nil {
+		log.Info("capability catalog loaded", "bundles", len(fc.Capabilities))
+	} else {
+		log.Info("no capability catalog configured — permissive mode")
 	}
 
 	if fc.Backend != nil {

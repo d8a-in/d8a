@@ -404,8 +404,15 @@ func TestToolsList_ForwardedToBackend(t *testing.T) {
 	if err := json.Unmarshal(msg.Result, &result); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if len(result.Tools) != 1 || result.Tools[0].Name != "echo" {
-		t.Fatalf("tools/list = %+v, want [echo]", result.Tools)
+	// Permissive mode (no catalog on these opts) → the backend's
+	// full tool list comes through verbatim. The fake now exposes
+	// echo + secret-tool; we check both are present.
+	names := map[string]bool{}
+	for _, tool := range result.Tools {
+		names[tool.Name] = true
+	}
+	if !names["echo"] || !names["secret-tool"] {
+		t.Fatalf("tools/list missing expected tools; got %+v", result.Tools)
 	}
 }
 
@@ -467,5 +474,195 @@ func TestMethodNotFound_WithoutBackend(t *testing.T) {
 	msg := decodeRPC(t, resp.Body)
 	if msg.Error == nil || msg.Error.Code != ErrCodeMethodNotFound {
 		t.Fatalf("Error = %+v, want code %d", msg.Error, ErrCodeMethodNotFound)
+	}
+}
+
+// ----- catalog / curated capabilities (M6) -----
+
+// mcpTestOptsWithCatalog returns opts with the fake-MCP backend AND
+// a validator whose key has the given scopes. Catalog grants "echo"
+// to scope "demo:basic" and nothing else.
+func mcpTestOptsWithCatalog(t *testing.T, scopes []string) testServerOpts {
+	t.Helper()
+	const audience = "http://aud.example/mcp"
+	v, err := NewAPIKeyValidator([]APIKey{{
+		TokenHashHex: HashToken("secret"),
+		Audience:     audience,
+		Subject:      "alice",
+		Scopes:       scopes,
+	}})
+	if err != nil {
+		t.Fatalf("validator: %v", err)
+	}
+	return testServerOpts{
+		validator: v,
+		audience:  audience,
+		runner: NewStdioRunner(fakeMCPCmd(t),
+			Implementation{Name: "d8a-server-test", Version: "0"},
+			newRunnerLogger()),
+		catalog: NewCatalog(map[string]CapabilityBundle{
+			"demo:basic": {Tools: []string{"echo"}}, // grants "echo" only
+			"demo:full":  {Tools: []string{"*"}},    // wildcard
+		}),
+	}
+}
+
+func TestCatalog_InitializeFiltersUnentitledCapabilities(t *testing.T) {
+	// Identity has zero scopes → no tools granted → the backend
+	// announces "tools" but our initialize response must NOT.
+	base, teardown := startTestServer(t, mcpTestOptsWithCatalog(t, nil))
+	defer teardown()
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"x","version":"0"}}}`
+	resp := mcpPost(t, base, "secret", "", body)
+	defer resp.Body.Close()
+
+	msg := decodeRPC(t, resp.Body)
+	var result InitializeResult
+	if err := json.Unmarshal(msg.Result, &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := result.Capabilities["tools"]; ok {
+		t.Fatalf("identity with no scopes should not see 'tools' capability; got %v", result.Capabilities)
+	}
+}
+
+func TestCatalog_InitializeKeepsEntitledCapabilities(t *testing.T) {
+	// Identity granted "demo:basic" → tools key remains.
+	base, teardown := startTestServer(t, mcpTestOptsWithCatalog(t, []string{"demo:basic"}))
+	defer teardown()
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"x","version":"0"}}}`
+	resp := mcpPost(t, base, "secret", "", body)
+	defer resp.Body.Close()
+
+	msg := decodeRPC(t, resp.Body)
+	var result InitializeResult
+	if err := json.Unmarshal(msg.Result, &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := result.Capabilities["tools"]; !ok {
+		t.Fatalf("identity with demo:basic should see 'tools' capability; got %v", result.Capabilities)
+	}
+}
+
+func TestCatalog_ToolsListDropsUnentitled(t *testing.T) {
+	// "demo:basic" grants only "echo"; the fake MCP also exposes
+	// "secret-tool"; tools/list MUST hide secret-tool.
+	base, teardown := startTestServer(t, mcpTestOptsWithCatalog(t, []string{"demo:basic"}))
+	defer teardown()
+
+	sid := initializeSession(t, base, "secret")
+	resp := mcpPost(t, base, "secret", sid, `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)
+	defer resp.Body.Close()
+
+	msg := decodeRPC(t, resp.Body)
+	if msg.Error != nil {
+		t.Fatalf("Error = %+v", msg.Error)
+	}
+	var result struct {
+		Tools []struct {
+			Name string `json:"name"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(msg.Result, &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, tool := range result.Tools {
+		if tool.Name == "secret-tool" {
+			t.Fatalf("'secret-tool' leaked through tools/list under demo:basic; got %+v", result.Tools)
+		}
+	}
+	if len(result.Tools) != 1 || result.Tools[0].Name != "echo" {
+		t.Fatalf("expected exactly [echo]; got %+v", result.Tools)
+	}
+}
+
+func TestCatalog_ToolsCallBlocksUnentitled(t *testing.T) {
+	// Direct call to "secret-tool" must be rejected even though the
+	// backing MCP would handle it — the PEP refuses before the
+	// request leaves our process.
+	base, teardown := startTestServer(t, mcpTestOptsWithCatalog(t, []string{"demo:basic"}))
+	defer teardown()
+
+	sid := initializeSession(t, base, "secret")
+	body := `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"secret-tool","arguments":{}}}`
+	resp := mcpPost(t, base, "secret", sid, body)
+	defer resp.Body.Close()
+
+	msg := decodeRPC(t, resp.Body)
+	if msg.Error == nil || msg.Error.Code != ErrCodeMethodNotFound {
+		t.Fatalf("expected method-not-found denial; got %+v", msg.Error)
+	}
+}
+
+func TestCatalog_ToolsCallAllowsEntitled(t *testing.T) {
+	// "echo" is granted; tools/call with name=echo must succeed.
+	base, teardown := startTestServer(t, mcpTestOptsWithCatalog(t, []string{"demo:basic"}))
+	defer teardown()
+
+	sid := initializeSession(t, base, "secret")
+	body := `{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"echo","arguments":{"x":1}}}`
+	resp := mcpPost(t, base, "secret", sid, body)
+	defer resp.Body.Close()
+
+	msg := decodeRPC(t, resp.Body)
+	if msg.Error != nil {
+		t.Fatalf("entitled call rejected: %+v", msg.Error)
+	}
+}
+
+func TestCatalog_WildcardScopeGrantsEverything(t *testing.T) {
+	// demo:full → ["*"] → every tool reachable.
+	base, teardown := startTestServer(t, mcpTestOptsWithCatalog(t, []string{"demo:full"}))
+	defer teardown()
+
+	sid := initializeSession(t, base, "secret")
+
+	// Both tools should appear in tools/list.
+	resp := mcpPost(t, base, "secret", sid, `{"jsonrpc":"2.0","id":5,"method":"tools/list"}`)
+	msg := decodeRPC(t, resp.Body)
+	resp.Body.Close()
+	var listed struct {
+		Tools []struct {
+			Name string `json:"name"`
+		} `json:"tools"`
+	}
+	_ = json.Unmarshal(msg.Result, &listed)
+	if len(listed.Tools) != 2 {
+		t.Fatalf("wildcard scope should list both tools; got %+v", listed.Tools)
+	}
+
+	// And secret-tool should be callable.
+	resp = mcpPost(t, base, "secret", sid,
+		`{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"secret-tool","arguments":{}}}`)
+	msg = decodeRPC(t, resp.Body)
+	resp.Body.Close()
+	if msg.Error != nil {
+		t.Fatalf("wildcard scope blocked secret-tool: %+v", msg.Error)
+	}
+}
+
+func TestCatalog_PermissiveWhenNoCatalog(t *testing.T) {
+	// Regression: pre-M6 behavior — no catalog configured means
+	// every authenticated identity has access to every tool the
+	// backend exposes. Used by the existing Postgres demo config
+	// (and existing tests using mcpTestOptsWithBackend).
+	opts := mcpTestOptsWithBackend(t) // no catalog set
+	base, teardown := startTestServer(t, opts)
+	defer teardown()
+
+	sid := initializeSession(t, base, "secret")
+	resp := mcpPost(t, base, "secret", sid, `{"jsonrpc":"2.0","id":7,"method":"tools/list"}`)
+	defer resp.Body.Close()
+	msg := decodeRPC(t, resp.Body)
+	var listed struct {
+		Tools []struct {
+			Name string `json:"name"`
+		} `json:"tools"`
+	}
+	_ = json.Unmarshal(msg.Result, &listed)
+	if len(listed.Tools) != 2 {
+		t.Fatalf("permissive mode should expose both tools; got %+v", listed.Tools)
 	}
 }

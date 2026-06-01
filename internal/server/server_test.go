@@ -18,6 +18,7 @@ type testServerOpts struct {
 	audience       string
 	allowedOrigins []string
 	runner         Runner
+	catalog        *Catalog
 }
 
 // pickAddr returns a free loopback address. There is a small race
@@ -49,6 +50,7 @@ func startTestServer(t *testing.T, opts testServerOpts) (baseURL string, teardow
 		AllowedOrigins: opts.allowedOrigins,
 		Validator:      opts.validator,
 		Runner:         opts.runner,
+		Catalog:        opts.catalog,
 	}, log)
 
 	ctx, cancel := context.WithCancel(context.Background())

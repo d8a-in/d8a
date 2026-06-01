@@ -61,6 +61,13 @@ type Config struct {
 	// When nil, the server only handles ping locally and returns
 	// "method not found" for everything else.
 	Runner Runner
+
+	// Catalog filters what each authenticated identity can see and
+	// do at the MCP protocol layer (initialize capabilities,
+	// tools/list, tools/call, resources/*, prompts/*). nil = no
+	// catalog configured → permissive mode (back-compat with the
+	// pre-M6 behavior).
+	Catalog *Catalog
 }
 
 // Server is the d8a-server runtime. Construct with New, then call Run.
@@ -78,6 +85,10 @@ type Server struct {
 	// initialize. Returned in d8a-server's initialize response so
 	// upstream MCP clients see the underlying capabilities.
 	backendCaps ServerCapabilities
+
+	// catalog filters per-identity what each session sees and can
+	// call. nil = no catalog → permissive mode.
+	catalog *Catalog
 }
 
 // New constructs a Server. Defaults are applied to cfg before use.
@@ -90,6 +101,7 @@ func New(cfg Config, log *slog.Logger) *Server {
 		cfg:      cfg,
 		log:      log,
 		sessions: cfg.Sessions,
+		catalog:  cfg.Catalog,
 	}
 	if s.sessions == nil {
 		s.sessions = NewInMemorySessionStore()
