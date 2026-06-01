@@ -645,6 +645,118 @@ func TestCatalog_WildcardScopeGrantsEverything(t *testing.T) {
 
 // ----- rate limiting (M9) -----
 
+// ----- partition-key MCP pooling (M10) -----
+
+// fakeMCPBackend returns a *Backend that builds runners by re-execing
+// the test binary as a fake MCP (same trick as fakeMCPCmd). Sandbox
+// is explicitly disabled — we're not testing bwrap here and the
+// test binary has unusual paths that aren't worth bind-mounting.
+func fakeMCPBackend(t *testing.T) *Backend {
+	t.Helper()
+	cmd := fakeMCPCmd(t)
+	return &Backend{
+		Command:    cmd.Path,
+		Args:       cmd.Args[1:], // Args[0] equals Path by convention; strip it
+		Env:        cmd.Env,
+		Sandbox:    &SandboxPolicy{Disabled: true},
+		ClientInfo: Implementation{Name: "d8a-server-test", Version: "0"},
+		Log:        newRunnerLogger(),
+	}
+}
+
+func TestPool_IsolateMode_DifferentIdentitiesGetDifferentRunners(t *testing.T) {
+	// Two API keys, two identities, Backend with shareSafe=false.
+	// alice's tools/call and bob's tools/call should reach DIFFERENT
+	// backing-MCP subprocesses — proven by comparing PIDs reported
+	// by test/whoami.
+	const audience = "http://aud.example/mcp"
+	v, err := NewAPIKeyValidator([]APIKey{
+		{TokenHashHex: HashToken("alice-secret"), Audience: audience, Subject: "alice"},
+		{TokenHashHex: HashToken("bob-secret"), Audience: audience, Subject: "bob"},
+	})
+	if err != nil {
+		t.Fatalf("validator: %v", err)
+	}
+	base, teardown := startTestServer(t, testServerOpts{
+		validator:        v,
+		audience:         audience,
+		backend:          fakeMCPBackend(t),
+		backendShareSafe: false, // ← isolate mode
+	})
+	defer teardown()
+
+	aliceSid := initializeSession(t, base, "alice-secret")
+	bobSid := initializeSession(t, base, "bob-secret")
+
+	alicePid := callWhoami(t, base, "alice-secret", aliceSid)
+	bobPid := callWhoami(t, base, "bob-secret", bobSid)
+
+	if alicePid == 0 || bobPid == 0 {
+		t.Fatalf("could not read PIDs (alice=%d bob=%d)", alicePid, bobPid)
+	}
+	if alicePid == bobPid {
+		t.Fatalf("isolate mode failed: alice and bob both routed to PID %d", alicePid)
+	}
+
+	// Same identity must consistently hit the same subprocess.
+	aliceAgain := callWhoami(t, base, "alice-secret", aliceSid)
+	if aliceAgain != alicePid {
+		t.Errorf("alice's second call hit PID %d, first hit %d — pool isn't sticky", aliceAgain, alicePid)
+	}
+}
+
+func TestPool_ShareSafeMode_AllIdentitiesShareOneRunner(t *testing.T) {
+	// Same setup but with shareSafe=true — both alice and bob must
+	// hit the SAME subprocess (one PID for everyone).
+	const audience = "http://aud.example/mcp"
+	v, err := NewAPIKeyValidator([]APIKey{
+		{TokenHashHex: HashToken("alice-secret"), Audience: audience, Subject: "alice"},
+		{TokenHashHex: HashToken("bob-secret"), Audience: audience, Subject: "bob"},
+	})
+	if err != nil {
+		t.Fatalf("validator: %v", err)
+	}
+	base, teardown := startTestServer(t, testServerOpts{
+		validator:        v,
+		audience:         audience,
+		backend:          fakeMCPBackend(t),
+		backendShareSafe: true, // ← shared
+	})
+	defer teardown()
+
+	aliceSid := initializeSession(t, base, "alice-secret")
+	bobSid := initializeSession(t, base, "bob-secret")
+
+	alicePid := callWhoami(t, base, "alice-secret", aliceSid)
+	bobPid := callWhoami(t, base, "bob-secret", bobSid)
+	if alicePid != bobPid {
+		t.Fatalf("share-safe mode failed: alice=%d bob=%d (should be the same PID)", alicePid, bobPid)
+	}
+}
+
+// callWhoami sends the test-only test/whoami request and returns the
+// "pid" field of the backing MCP's response. Returns 0 if the call
+// failed or returned a non-int pid.
+func callWhoami(t *testing.T, base, token, sid string) int {
+	t.Helper()
+	resp := mcpPost(t, base, token, sid, `{"jsonrpc":"2.0","id":50,"method":"test/whoami"}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("whoami status = %d", resp.StatusCode)
+	}
+	msg := decodeRPC(t, resp.Body)
+	if msg.Error != nil {
+		t.Fatalf("whoami error: %+v", msg.Error)
+	}
+	var out struct {
+		PID int `json:"pid"`
+	}
+	if err := json.Unmarshal(msg.Result, &out); err != nil {
+		t.Fatalf("whoami decode: %v", err)
+	}
+	return out.PID
+}
+
 func TestRateLimit_ThrottlesAfterBurstExhausted(t *testing.T) {
 	// burst=2: the first two POSTs to /mcp succeed (auth + bearer
 	// + a JSON-RPC error from the parse path is fine — the rate

@@ -54,13 +54,23 @@ type Config struct {
 	// InMemorySessionStore is constructed in New.
 	Sessions SessionStore
 
-	// Runner is an optional backing MCP. When set, Run starts it
-	// before accepting HTTP traffic, caches its advertised
-	// capabilities (so `initialize` responses can announce them),
-	// forwards MCP requests through it, and stops it on shutdown.
-	// When nil, the server only handles ping locally and returns
-	// "method not found" for everything else.
+	// Runner is the legacy / test path: a single Runner shared by
+	// every request. Mutually exclusive with Backend — set one or
+	// the other. Tests typically set this to a pre-built fake or
+	// StdioRunner.
 	Runner Runner
+
+	// Backend describes how to spawn backing-MCP subprocesses on
+	// demand. When set, Run constructs a RunnerPool from it and
+	// dispatches requests through the pool (mutually exclusive
+	// with Runner).
+	Backend *Backend
+
+	// BackendShareSafe controls pool behavior when Backend is set:
+	// true (default) means one Runner serves every identity;
+	// false means each identity gets its own Runner. See
+	// brainstorming #112/#113.
+	BackendShareSafe bool
 
 	// Catalog filters what each authenticated identity can see and
 	// do at the MCP protocol layer (initialize capabilities,
@@ -105,13 +115,21 @@ type Server struct {
 	http     *http.Server
 	sessions SessionStore
 
-	// runner is the live backing MCP, populated by Run after a
-	// successful Start. nil when no runner is configured.
+	// runner is the live backing MCP from the legacy path, populated
+	// by Run after a successful Start. nil when no runner is
+	// configured.
 	runner Runner
+
+	// pool is the multi-instance backing-MCP pool from the Backend
+	// path. nil when no Backend was configured. Mutually exclusive
+	// with runner.
+	pool *RunnerPool
 
 	// backendCaps is what the backing MCP advertised during its own
 	// initialize. Returned in d8a-server's initialize response so
-	// upstream MCP clients see the underlying capabilities.
+	// upstream MCP clients see the underlying capabilities. In pool
+	// mode it's the union (single-backend pools advertise the same
+	// caps for every instance).
 	backendCaps ServerCapabilities
 
 	// catalog filters per-identity what each session sees and can
@@ -245,9 +263,12 @@ const shutdownTimeout = 10 * time.Second
 // capabilities, and stops it *after* HTTP has drained so in-flight
 // requests are not abruptly cut off.
 func (s *Server) Run(ctx context.Context) error {
-	if s.cfg.Runner != nil {
+	switch {
+	case s.cfg.Runner != nil && s.cfg.Backend != nil:
+		return fmt.Errorf("Config.Runner and Config.Backend are mutually exclusive")
+	case s.cfg.Runner != nil:
 		s.runner = s.cfg.Runner
-		s.log.Info("starting backing MCP")
+		s.log.Info("starting backing MCP (singleton)")
 		caps, err := s.runner.Start(ctx)
 		if err != nil {
 			return fmt.Errorf("backing mcp start: %w", err)
@@ -256,6 +277,19 @@ func (s *Server) Run(ctx context.Context) error {
 		defer func() {
 			if err := s.runner.Stop(); err != nil {
 				s.log.Warn("backing mcp stop", "err", err)
+			}
+		}()
+	case s.cfg.Backend != nil:
+		s.pool = NewRunnerPool(*s.cfg.Backend, s.cfg.BackendShareSafe, s.log)
+		s.log.Info("starting backing MCP pool",
+			"share_safe", s.cfg.BackendShareSafe)
+		if err := s.pool.Start(ctx); err != nil {
+			return fmt.Errorf("backing mcp pool start: %w", err)
+		}
+		s.backendCaps = s.pool.Caps()
+		defer func() {
+			if err := s.pool.Close(); err != nil {
+				s.log.Warn("backing mcp pool stop", "err", err)
 			}
 		}()
 	}

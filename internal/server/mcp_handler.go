@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -146,6 +147,21 @@ func (s *Server) handleInitialize(w http.ResponseWriter, r *http.Request, msg JS
 	writeJSONRPC(w, http.StatusOK, resp)
 }
 
+// runnerForRequest returns the Runner that should serve a request
+// from the given identity, using the legacy singleton path when
+// Config.Runner is set or the pool's per-partition lookup when
+// Config.Backend is set. Returns (nil, nil) when neither is
+// configured.
+func (s *Server) runnerForRequest(ctx context.Context, identity Identity) (Runner, error) {
+	if s.runner != nil {
+		return s.runner, nil
+	}
+	if s.pool != nil {
+		return s.pool.RunnerFor(ctx, identity)
+	}
+	return nil, nil
+}
+
 // handleNotification handles a JSON-RPC notification (no id, no
 // response). The MCP spec says notifications receive HTTP 202
 // Accepted with no body.
@@ -161,8 +177,13 @@ func (s *Server) handleNotification(w http.ResponseWriter, r *http.Request, sess
 	case "notifications/initialized":
 		s.sessions.MarkInitialized(sess.ID, now)
 	default:
-		if s.runner != nil {
-			if err := s.runner.Notify(r.Context(), msg.Method, msg.Params); err != nil {
+		identity, _ := IdentityFromContext(r.Context())
+		runner, err := s.runnerForRequest(r.Context(), identity)
+		if err != nil {
+			s.log.Warn("runner lookup failed for notification",
+				"method", msg.Method, "err", err)
+		} else if runner != nil {
+			if err := runner.Notify(r.Context(), msg.Method, msg.Params); err != nil {
 				s.log.Warn("forward notification failed",
 					"method", msg.Method, "err", err)
 			}
@@ -215,17 +236,38 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request, sess *Ses
 	s.forwardGeneric(w, r, msg)
 }
 
+// resolveRunner returns the appropriate runner for the request's
+// identity and writes a JSON-RPC error to w if none is available
+// (returning nil to tell the caller "I already responded, stop").
+// Used by every forwarding helper below.
+func (s *Server) resolveRunner(w http.ResponseWriter, r *http.Request, msg JSONRPCMessage) Runner {
+	identity, _ := IdentityFromContext(r.Context())
+	runner, err := s.runnerForRequest(r.Context(), identity)
+	if err != nil {
+		s.log.Warn("backing mcp unavailable",
+			"method", msg.Method, "subject", identity.Subject, "err", err)
+		writeJSONRPC(w, http.StatusOK, NewErrorResponse(msg.ID, ErrCodeInternalError,
+			"backing mcp unavailable: "+err.Error(), nil))
+		return nil
+	}
+	if runner == nil {
+		writeJSONRPC(w, http.StatusOK, NewErrorResponse(msg.ID, ErrCodeMethodNotFound,
+			"method not implemented: "+msg.Method, nil))
+		return nil
+	}
+	return runner
+}
+
 // forwardGeneric forwards a JSON-RPC request to the backing MCP and
 // returns its response verbatim. Used for methods that aren't
 // catalog-filtered (completion/*, logging/*, resources/templates/list,
 // future protocol additions).
 func (s *Server) forwardGeneric(w http.ResponseWriter, r *http.Request, msg JSONRPCMessage) {
-	if s.runner == nil {
-		writeJSONRPC(w, http.StatusOK, NewErrorResponse(msg.ID, ErrCodeMethodNotFound,
-			"method not implemented: "+msg.Method, nil))
+	runner := s.resolveRunner(w, r, msg)
+	if runner == nil {
 		return
 	}
-	rawResult, rpcErr := s.runner.Call(r.Context(), msg.Method, msg.Params)
+	rawResult, rpcErr := runner.Call(r.Context(), msg.Method, msg.Params)
 	if rpcErr != nil {
 		writeJSONRPC(w, http.StatusOK, NewErrorResponse(msg.ID, rpcErr.Code, rpcErr.Message, rpcErr.Data))
 		return
@@ -242,12 +284,11 @@ func (s *Server) forwardAndFilterList(
 	w http.ResponseWriter, r *http.Request, _ *Session,
 	msg JSONRPCMessage, listKey string, allow func(string) bool,
 ) {
-	if s.runner == nil {
-		writeJSONRPC(w, http.StatusOK, NewErrorResponse(msg.ID, ErrCodeMethodNotFound,
-			"method not implemented: "+msg.Method, nil))
+	runner := s.resolveRunner(w, r, msg)
+	if runner == nil {
 		return
 	}
-	rawResult, rpcErr := s.runner.Call(r.Context(), msg.Method, msg.Params)
+	rawResult, rpcErr := runner.Call(r.Context(), msg.Method, msg.Params)
 	if rpcErr != nil {
 		writeJSONRPC(w, http.StatusOK, NewErrorResponse(msg.ID, rpcErr.Code, rpcErr.Message, rpcErr.Data))
 		return
@@ -274,9 +315,8 @@ func (s *Server) forwardWithNameGate(
 	w http.ResponseWriter, r *http.Request, sess *Session,
 	msg JSONRPCMessage, paramKey string, allow func(string) bool,
 ) {
-	if s.runner == nil {
-		writeJSONRPC(w, http.StatusOK, NewErrorResponse(msg.ID, ErrCodeMethodNotFound,
-			"method not implemented: "+msg.Method, nil))
+	runner := s.resolveRunner(w, r, msg)
+	if runner == nil {
 		return
 	}
 	var params map[string]json.RawMessage
@@ -302,7 +342,7 @@ func (s *Server) forwardWithNameGate(
 			"not permitted: "+msg.Method+" "+ident, nil))
 		return
 	}
-	rawResult, rpcErr := s.runner.Call(r.Context(), msg.Method, msg.Params)
+	rawResult, rpcErr := runner.Call(r.Context(), msg.Method, msg.Params)
 	if rpcErr != nil {
 		writeJSONRPC(w, http.StatusOK, NewErrorResponse(msg.ID, rpcErr.Code, rpcErr.Message, rpcErr.Data))
 		return

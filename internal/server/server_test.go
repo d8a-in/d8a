@@ -14,14 +14,16 @@ import (
 // testServerOpts customizes the test-server harness without making the
 // production Config type depend on test concerns.
 type testServerOpts struct {
-	validator      Validator
-	audience       string
-	allowedOrigins []string
-	runner         Runner
-	catalog        *Catalog
-	idleTimeout    time.Duration
-	sweepInterval  time.Duration
-	rateLimit      RateLimit
+	validator        Validator
+	audience         string
+	allowedOrigins   []string
+	runner           Runner
+	backend          *Backend
+	backendShareSafe bool
+	catalog          *Catalog
+	idleTimeout      time.Duration
+	sweepInterval    time.Duration
+	rateLimit        RateLimit
 }
 
 // pickAddr returns a free loopback address. There is a small race
@@ -48,15 +50,17 @@ func startTestServer(t *testing.T, opts testServerOpts) (baseURL string, teardow
 	addr := pickAddr(t)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv := New(Config{
-		ListenAddr:     addr,
-		Audience:       opts.audience,
-		AllowedOrigins: opts.allowedOrigins,
-		Validator:      opts.validator,
-		Runner:         opts.runner,
-		Catalog:        opts.catalog,
-		IdleTimeout:    opts.idleTimeout,
-		SweepInterval:  opts.sweepInterval,
-		RateLimit:      opts.rateLimit,
+		ListenAddr:       addr,
+		Audience:         opts.audience,
+		AllowedOrigins:   opts.allowedOrigins,
+		Validator:        opts.validator,
+		Runner:           opts.runner,
+		Backend:          opts.backend,
+		BackendShareSafe: opts.backendShareSafe,
+		Catalog:          opts.catalog,
+		IdleTimeout:      opts.idleTimeout,
+		SweepInterval:    opts.sweepInterval,
+		RateLimit:        opts.rateLimit,
 	}, log)
 
 	ctx, cancel := context.WithCancel(context.Background())

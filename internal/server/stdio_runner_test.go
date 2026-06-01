@@ -65,6 +65,14 @@ func runFakeMCP(in io.Reader, out io.Writer) {
 				"content": req.Params,
 			})
 			_ = enc.Encode(resp)
+		case "test/whoami":
+			// Test-only method: returns this subprocess's PID so
+			// pool isolation tests can prove two requests went to
+			// different backing MCP instances.
+			resp, _ := NewResultResponse(req.ID, map[string]int{
+				"pid": os.Getpid(),
+			})
+			_ = enc.Encode(resp)
 		case "boom":
 			_ = enc.Encode(NewErrorResponse(req.ID, -32000, "boom", nil))
 		default:

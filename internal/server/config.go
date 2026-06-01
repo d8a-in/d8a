@@ -99,6 +99,14 @@ type BackendConfig struct {
 	// see SandboxPolicy. To bypass containment entirely, set
 	// {"sandbox": {"disabled": true}} (strongly discouraged).
 	Sandbox *SandboxPolicy `json:"sandbox,omitempty"`
+
+	// Isolate, when true, gives every authenticated identity its
+	// own backing-MCP subprocess (partition-key pooling per
+	// brainstorming #112/#113). Default (false) keeps one shared
+	// MCP instance for all identities — appropriate when the MCP
+	// has no per-user state and uses a single set of credentials
+	// (the Postgres demo's read-only role is the canonical example).
+	Isolate bool `json:"isolate,omitempty"`
 }
 
 // LoadFileConfig reads a JSON FileConfig from disk.

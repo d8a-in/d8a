@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"os/signal"
 	"sort"
 	"syscall"
@@ -95,48 +94,48 @@ func main() {
 		// (SEP-1024 / brainstorming #121: explicit consent surface.)
 		log.Info("backing mcp configured",
 			"command", fc.Backend.Command,
-			"args", fc.Backend.Args)
+			"args", fc.Backend.Args,
+			"isolate", fc.Backend.Isolate)
 
-		cmd := exec.Command(fc.Backend.Command, fc.Backend.Args...)
+		var envSlice []string
 		if len(fc.Backend.Env) > 0 {
 			keys := make([]string, 0, len(fc.Backend.Env))
 			for k := range fc.Backend.Env {
 				keys = append(keys, k)
 			}
 			sort.Strings(keys)
-			env := make([]string, 0, len(keys))
 			for _, k := range keys {
-				env = append(env, k+"="+fc.Backend.Env[k])
+				envSlice = append(envSlice, k+"="+fc.Backend.Env[k])
 			}
-			cmd.Env = env
 		} else {
-			// Empty (not nil) so StdioRunner doesn't default to
-			// inheriting our environment.
-			cmd.Env = []string{}
+			// Empty (not nil) so the StdioRunner factory doesn't
+			// inherit d8a-server's environment.
+			envSlice = []string{}
 		}
 
-		// Wrap the subprocess in a bubblewrap sandbox (PID/IPC/UTS
-		// + filesystem isolation by default; network shared unless
-		// Sandbox.Network = "none"). nil policy = safe defaults; an
-		// explicit {"disabled": true} bypasses the sandbox.
-		wrapped, err := server.WrapCommand(cmd, fc.Backend.Sandbox)
-		if err != nil {
-			log.Error("sandbox setup failed", "err", err,
-				"hint", "install bubblewrap (apt install bubblewrap) or set backend.sandbox.disabled=true")
-			os.Exit(1)
-		}
-		if wrapped != cmd {
+		if fc.Backend.Sandbox != nil && fc.Backend.Sandbox.Disabled {
+			log.Warn("backing mcp sandbox DISABLED — running without containment")
+		} else {
 			log.Info("backing mcp sandbox enabled",
 				"network", coalesce(fc.Backend.Sandbox, "host"))
-		} else {
-			log.Warn("backing mcp sandbox DISABLED — running without containment")
 		}
 
-		cfg.Runner = server.NewStdioRunner(wrapped, server.Implementation{
-			Name:    "d8a-server",
-			Title:   "d8a Server",
-			Version: core.Version,
-		}, log)
+		// Use the pool path (Config.Backend) so identities can be
+		// isolated when fc.Backend.Isolate is true. shareSafe is
+		// the inverse of Isolate.
+		cfg.Backend = &server.Backend{
+			Command: fc.Backend.Command,
+			Args:    fc.Backend.Args,
+			Env:     envSlice,
+			Sandbox: fc.Backend.Sandbox,
+			ClientInfo: server.Implementation{
+				Name:    "d8a-server",
+				Title:   "d8a Server",
+				Version: core.Version,
+			},
+			Log: log,
+		}
+		cfg.BackendShareSafe = !fc.Backend.Isolate
 	}
 
 	// Catch SIGINT (Ctrl-C) and SIGTERM (systemd / kill) so the
