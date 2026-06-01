@@ -1,5 +1,9 @@
 # d8a
 
+[![ci](https://github.com/d8a-in/d8a/actions/workflows/ci.yml/badge.svg)](https://github.com/d8a-in/d8a/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Go Reference](https://pkg.go.dev/badge/d8a.in/d8a.svg)](https://pkg.go.dev/d8a.in/d8a)
+
 A blind MCP gateway: connect your team's AI to internal services without exposing data or credentials to anyone outside your network.
 
 **Status:** Early scaffold. Not yet usable.
@@ -25,6 +29,14 @@ Or directly:
 go build ./...
 go run ./cmd/server --version
 go run ./cmd/client --version
+```
+
+Clone:
+
+```bash
+git clone https://github.com/d8a-in/d8a.git
+cd d8a
+make build
 ```
 
 ## License & Model
