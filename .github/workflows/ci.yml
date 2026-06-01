@@ -28,6 +28,11 @@ jobs:
           # cache. Re-enable when we add a go.sum.
           cache: false
 
+      - name: install bubblewrap
+        # The sandbox tests exec bwrap to verify real containment;
+        # ubuntu-latest runners don't have it pre-installed.
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
       - name: go vet
         run: go vet ./...
 

@@ -62,6 +62,13 @@ type BackendConfig struct {
 	// Empty / nil means an empty environment (no PATH, no HOME, etc.) —
 	// the operator must explicitly enumerate what the MCP needs.
 	Env map[string]string `json:"env,omitempty"`
+
+	// Sandbox controls how the subprocess is contained (bubblewrap-
+	// based PID/IPC/UTS/filesystem isolation, plus optional network
+	// isolation). nil means "sandbox enabled with safe defaults" —
+	// see SandboxPolicy. To bypass containment entirely, set
+	// {"sandbox": {"disabled": true}} (strongly discouraged).
+	Sandbox *SandboxPolicy `json:"sandbox,omitempty"`
 }
 
 // LoadFileConfig reads a JSON FileConfig from disk.

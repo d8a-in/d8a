@@ -95,7 +95,25 @@ func main() {
 			// inheriting our environment.
 			cmd.Env = []string{}
 		}
-		cfg.Runner = server.NewStdioRunner(cmd, server.Implementation{
+
+		// Wrap the subprocess in a bubblewrap sandbox (PID/IPC/UTS
+		// + filesystem isolation by default; network shared unless
+		// Sandbox.Network = "none"). nil policy = safe defaults; an
+		// explicit {"disabled": true} bypasses the sandbox.
+		wrapped, err := server.WrapCommand(cmd, fc.Backend.Sandbox)
+		if err != nil {
+			log.Error("sandbox setup failed", "err", err,
+				"hint", "install bubblewrap (apt install bubblewrap) or set backend.sandbox.disabled=true")
+			os.Exit(1)
+		}
+		if wrapped != cmd {
+			log.Info("backing mcp sandbox enabled",
+				"network", coalesce(fc.Backend.Sandbox, "host"))
+		} else {
+			log.Warn("backing mcp sandbox DISABLED — running without containment")
+		}
+
+		cfg.Runner = server.NewStdioRunner(wrapped, server.Implementation{
 			Name:    "d8a-server",
 			Title:   "d8a Server",
 			Version: core.Version,
@@ -113,4 +131,13 @@ func main() {
 		os.Exit(1)
 	}
 	log.Info("d8a-server stopped cleanly")
+}
+
+// coalesce returns the policy's Network field, or fallback if the
+// policy is nil or the field is empty.
+func coalesce(p *server.SandboxPolicy, fallback string) string {
+	if p == nil || p.Network == "" {
+		return fallback
+	}
+	return p.Network
 }
