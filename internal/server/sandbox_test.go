@@ -95,8 +95,8 @@ func TestWrapCommand_UserBindsAreAdditiveNotReplacing(t *testing.T) {
 	}
 	args := strings.Join(wrapped.Args, " ")
 	for _, must := range []string{
-		"--ro-bind-try /usr /usr",       // default
-		"--ro-bind-try /etc /etc",       // default
+		"--ro-bind-try /usr /usr",                             // default
+		"--ro-bind-try /etc /etc",                             // default
 		"--ro-bind-try /home/example/.nvm /home/example/.nvm", // user-supplied
 	} {
 		if !strings.Contains(args, must) {
