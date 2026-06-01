@@ -19,6 +19,8 @@ type testServerOpts struct {
 	allowedOrigins []string
 	runner         Runner
 	catalog        *Catalog
+	idleTimeout    time.Duration
+	sweepInterval  time.Duration
 }
 
 // pickAddr returns a free loopback address. There is a small race
@@ -51,6 +53,8 @@ func startTestServer(t *testing.T, opts testServerOpts) (baseURL string, teardow
 		Validator:      opts.validator,
 		Runner:         opts.runner,
 		Catalog:        opts.catalog,
+		IdleTimeout:    opts.idleTimeout,
+		SweepInterval:  opts.sweepInterval,
 	}, log)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -184,6 +188,32 @@ func TestMCP_RejectsBadProtocolVersion(t *testing.T) {
 
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+// TestServer_SessionGCExpiresIdleSessions black-box tests the idle-
+// session expiry feature: configure tiny timeouts (150ms idle, 50ms
+// sweep), open a session, let it sit, then verify a subsequent
+// request against it returns 404 (session not found) instead of
+// 200 — proving the GC goroutine reaped it.
+func TestServer_SessionGCExpiresIdleSessions(t *testing.T) {
+	opts := mcpTestOpts(t)
+	opts.idleTimeout = 150 * time.Millisecond
+	opts.sweepInterval = 50 * time.Millisecond
+	base, teardown := startTestServer(t, opts)
+	defer teardown()
+
+	sid := initializeSession(t, base, "secret")
+
+	// Wait past the idle window. Don't touch the session in
+	// between — Touch is what would refresh LastSeen and defeat
+	// the test.
+	time.Sleep(350 * time.Millisecond)
+
+	resp := mcpPost(t, base, "secret", sid, `{"jsonrpc":"2.0","id":99,"method":"ping"}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (GC should have reaped the idle session)", resp.StatusCode)
 	}
 }
 

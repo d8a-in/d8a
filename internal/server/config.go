@@ -50,6 +50,15 @@ type FileConfig struct {
 	// its initialize handshake at startup, and forwards MCP method
 	// calls through it.
 	Backend *BackendConfig `json:"backend,omitempty"`
+
+	// IdleTimeoutSeconds controls session GC: sessions with no
+	// activity for this long are deleted. Zero applies the default
+	// (DefaultIdleTimeout, 30m); negative disables GC entirely.
+	IdleTimeoutSeconds int `json:"idleTimeoutSeconds,omitempty"`
+
+	// SweepIntervalSeconds is how often the GC goroutine wakes
+	// (Zero = DefaultSweepInterval, 1m).
+	SweepIntervalSeconds int `json:"sweepIntervalSeconds,omitempty"`
 }
 
 // BackendConfig describes the subprocess to spawn as the backing MCP.

@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"sort"
 	"syscall"
+	"time"
 
 	"d8a.in/d8a/internal/core"
 	"d8a.in/d8a/internal/server"
@@ -69,6 +70,8 @@ func main() {
 		Validator:      validator,
 		ServerVersion:  core.Version,
 		Catalog:        server.NewCatalog(fc.Capabilities),
+		IdleTimeout:    time.Duration(fc.IdleTimeoutSeconds) * time.Second,
+		SweepInterval:  time.Duration(fc.SweepIntervalSeconds) * time.Second,
 	}
 	if cfg.Catalog != nil {
 		log.Info("capability catalog loaded", "bundles", len(fc.Capabilities))

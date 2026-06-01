@@ -68,7 +68,30 @@ type Config struct {
 	// catalog configured → permissive mode (back-compat with the
 	// pre-M6 behavior).
 	Catalog *Catalog
+
+	// IdleTimeout controls how long a session can go without
+	// activity before the background GC removes it. The zero value
+	// applies a sensible default (DefaultIdleTimeout); set to a
+	// negative duration to disable the GC entirely (sessions live
+	// forever — only suitable for short-lived test processes).
+	IdleTimeout time.Duration
+
+	// SweepInterval is how often the GC goroutine wakes to check
+	// for expired sessions. The zero value applies a sensible
+	// default (DefaultSweepInterval).
+	SweepInterval time.Duration
 }
+
+// DefaultIdleTimeout is the session-GC idle threshold applied when
+// Config.IdleTimeout is zero. Half an hour balances "drop forgotten
+// browser tabs" against "don't kick an active assistant mid-task."
+const DefaultIdleTimeout = 30 * time.Minute
+
+// DefaultSweepInterval is how often the GC goroutine scans the
+// session store when Config.SweepInterval is zero. One minute is
+// fine-grained enough that the actual idle window is close to
+// IdleTimeout without burning CPU on idle servers.
+const DefaultSweepInterval = 1 * time.Minute
 
 // Server is the d8a-server runtime. Construct with New, then call Run.
 type Server struct {
@@ -140,6 +163,45 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.Handle("DELETE /mcp", mcpChain(s.handleMCPDelete))
 }
 
+// idleAndSweep resolves Config.IdleTimeout / Config.SweepInterval
+// into their effective values, applying defaults for zero and
+// returning (0, 0) when GC is explicitly disabled (IdleTimeout < 0).
+func (s *Server) idleAndSweep() (idle, sweep time.Duration) {
+	idle = s.cfg.IdleTimeout
+	switch {
+	case idle < 0:
+		return 0, 0 // GC disabled
+	case idle == 0:
+		idle = DefaultIdleTimeout
+	}
+	sweep = s.cfg.SweepInterval
+	if sweep <= 0 {
+		sweep = DefaultSweepInterval
+	}
+	return idle, sweep
+}
+
+// runSessionGC periodically sweeps the SessionStore for sessions
+// idle longer than the configured timeout. It exits when ctx is
+// canceled.
+func (s *Server) runSessionGC(ctx context.Context, idle, sweep time.Duration) {
+	s.log.Info("session GC enabled", "idle_timeout", idle, "sweep_interval", sweep)
+	ticker := time.NewTicker(sweep)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cutoff := time.Now().Add(-idle)
+			if n := s.sessions.ExpireBefore(cutoff); n > 0 {
+				s.log.Info("expired idle sessions",
+					"count", n, "idle_timeout", idle)
+			}
+		}
+	}
+}
+
 // handleHealthz is a basic liveness probe — proves the process is up
 // and serving. Real readiness (e.g. MCP runners ready) will live at a
 // different endpoint later.
@@ -174,6 +236,16 @@ func (s *Server) Run(ctx context.Context) error {
 				s.log.Warn("backing mcp stop", "err", err)
 			}
 		}()
+	}
+
+	// Start the session-GC goroutine unless explicitly disabled
+	// (Config.IdleTimeout < 0). It exits when ctx is canceled, just
+	// before HTTP shutdown begins — sessions outliving the server
+	// process don't matter, so no separate shutdown coordination
+	// is needed.
+	idleTimeout, sweepInterval := s.idleAndSweep()
+	if idleTimeout > 0 {
+		go s.runSessionGC(ctx, idleTimeout, sweepInterval)
 	}
 
 	s.log.Info("listening", "addr", s.cfg.ListenAddr)

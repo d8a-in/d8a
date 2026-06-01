@@ -37,6 +37,11 @@ type SessionStore interface {
 	MarkInitialized(id string, now time.Time) bool
 	Touch(id string, now time.Time) bool
 	Delete(id string) bool
+
+	// ExpireBefore deletes every session whose LastSeen is strictly
+	// before t. Returns the number of sessions removed so callers
+	// can log / report. Used by Server.Run's periodic GC sweep.
+	ExpireBefore(t time.Time) int
 }
 
 // InMemorySessionStore is a simple goroutine-safe in-memory store.
@@ -118,4 +123,19 @@ func (s *InMemorySessionStore) Delete(id string) bool {
 	}
 	delete(s.sessions, id)
 	return true
+}
+
+// ExpireBefore implements SessionStore. Iterates under the write
+// lock and removes everything older than t.
+func (s *InMemorySessionStore) ExpireBefore(t time.Time) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	deleted := 0
+	for id, sess := range s.sessions {
+		if sess.LastSeen.Before(t) {
+			delete(s.sessions, id)
+			deleted++
+		}
+	}
+	return deleted
 }
